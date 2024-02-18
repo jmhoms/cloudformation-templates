@@ -1,0 +1,74 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Check for existing Route 53 hosted zone and retrieve its ID
+
+Parameters:
+  DomainName:
+    Description: The domain name to check (e.g., example.com).
+    Type: String
+    AllowedPattern: '[a-zA-Z0-9.-]+'
+
+Resources:
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: LambdaPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: 'arn:aws:logs:*:*:*'
+              - Effect: Allow
+                Action:
+                  - 'route53:ListHostedZonesByName'
+                Resource: '*'
+
+  HostedZoneCheckerLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.8
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+          
+          def handler(event, context):
+              try:
+                  domain_name = event['ResourceProperties']['DomainName']
+                  client = boto3.client('route53')
+                  response = client.list_hosted_zones_by_name(DNSName=domain_name, MaxItems="1")
+                  hosted_zones = response['HostedZones']
+                  responseData = {}
+                  if hosted_zones and hosted_zones[0]['Name'].startswith(domain_name + '.'):
+                      responseData['HostedZoneId'] = hosted_zones[0]['Id'].split('/')[-1]
+                  else:
+                      responseData['HostedZoneId'] = 'Not Found'
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
+              except Exception as e:
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+      Timeout: 30
+
+  CheckHostedZoneCustomResource:
+    Type: Custom::HostedZoneChecker
+    Properties:
+      ServiceToken: !GetAtt HostedZoneCheckerLambda.Arn
+      DomainName: !Ref DomainName
+
+Outputs:
+  FoundHostedZoneID:
+    Description: The ID of the found hosted zone if it exists.
+    Value: !GetAtt CheckHostedZoneCustomResource.HostedZoneId
