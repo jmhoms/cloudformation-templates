@@ -1,0 +1,211 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Complete infrastructure for hosting a static website on AWS with Route 53, ACM, S3, CloudFront, and IAM.
+
+Parameters:
+  DomainName:
+    Description: The domain name for the static website (e.g., example.com).
+    Type: String
+    AllowedPattern: '[a-zA-Z0-9.-]+'
+
+  Customer:
+    Description: The customer name owning the static website for tagging purposes (e.g., Company LTD.).
+    Type: String
+    AllowedPattern: '[a-zA-Z0-9.-]+'
+
+  CreateHostedZone:
+    Description: Set to 'true' to create a new Route 53 hosted zone for the domain. Set to 'false' if a hosted zone for this domain already exists.
+    Type: String
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Default: 'true'
+
+Conditions:
+  CreateNewHostedZone: !Equals [ !Ref CreateHostedZone, 'true' ]
+
+Resources:
+  ConditionallyCreatedHostedZone:
+    Type: 'AWS::Route53::HostedZone'
+    Condition: CreateNewHostedZone
+    Properties:
+      Name: !Ref DomainName
+      HostedZoneConfig:
+        Comment: !Sub "Hosted zone for ${DomainName}"
+      HostedZoneTags:
+        - Key: "Solution"
+          Value: !Ref DomainName
+        - Key: "Customer"
+          Value: !Ref Customer
+
+  SiteCertificate:
+    Type: 'AWS::CertificateManager::Certificate'
+    Properties:
+      DomainName: !Ref DomainName
+      ValidationMethod: DNS
+      SubjectAlternativeNames:
+        - !Sub 'www.${DomainName}'
+      Tags:
+        - Key: "Solution"
+          Value: !Ref DomainName
+        - Key: "Customer"
+          Value: !Ref Customer
+
+  WebsiteBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: !Sub '${DomainName}-website'
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: error.html
+      Tags:
+        - Key: "Solution"
+          Value: !Ref DomainName
+        - Key: "Customer"
+          Value: !Ref Customer
+
+  LoggingBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: !Sub '${DomainName}-logs'
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred
+      Tags:
+        - Key: "Solution"
+          Value: !Ref DomainName
+        - Key: "Customer"
+          Value: !Ref Customer
+
+  LoggingBucketPolicy:
+    Type: 'AWS::S3::BucketPolicy'
+    Properties:
+      Bucket: !Ref LoggingBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowLogDelivery
+            Effect: Allow
+            Principal:
+              Service: "delivery.logs.amazonaws.com"
+            Action:
+              - "s3:PutObject"
+            Resource: !Sub 'arn:${AWS::Partition}:s3:::${LoggingBucket}/*'
+            Condition:
+              StringEquals:
+                "s3:x-amz-acl": "bucket-owner-full-control"
+          - Sid: AllowCloudFrontLogDelivery
+            Effect: Allow
+            Principal:
+              Service: "cloudfront.amazonaws.com"
+            Action:
+              - "s3:PutObject"
+            Resource: !Sub 'arn:${AWS::Partition}:s3:::${LoggingBucket}/cloudfront-logs/*'
+            Condition:
+              StringEquals:
+                "s3:x-amz-acl": "bucket-owner-full-control"
+
+  CloudFrontDistribution:
+    Type: 'AWS::CloudFront::Distribution'
+    Properties:
+      DistributionConfig:
+        Origins:
+          - Id: S3Origin
+            DomainName: !GetAtt WebsiteBucket.DomainName
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+        Enabled: true
+        DefaultRootObject: index.html
+        Aliases:
+          - !Ref DomainName
+          - !Sub 'www.${DomainName}'
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          ForwardedValues:
+            QueryString: false
+            Cookies:
+              Forward: none
+        Logging:
+          Bucket: !GetAtt LoggingBucket.DomainName
+          IncludeCookies: false
+          Prefix: 'cloudfront-logs/'
+        ViewerCertificate:
+          AcmCertificateArn: !Ref SiteCertificate
+          SslSupportMethod: sni-only
+        PriceClass: PriceClass_100
+      Tags:
+        - Key: "Solution"
+          Value: !Ref DomainName
+        - Key: "Customer"
+          Value: !Ref Customer
+
+  IAMUserForWebsiteManagement:
+    Type: 'AWS::IAM::User'
+    Properties:
+      UserName: !Sub '${DomainName}-manager'
+      Path: !Sub '/Customers/${Customer}/'
+      Policies:
+        - PolicyName: WebsiteManagementPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:DeleteObject
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${WebsiteBucket}/*'
+              - Effect: Allow
+                Action:
+                  - cloudfront:CreateInvalidation
+                Resource: '*'
+      Tags:
+        - Key: "Solution"
+          Value: !Ref DomainName
+        - Key: "Customer"
+          Value: !Ref Customer
+
+  IAMUserForWebsiteManagementCredentials:
+    Type: AWS::IAM::AccessKey
+    Properties:
+      Status: Active
+      UserName: !Ref IAMUserForWebsiteManagement
+
+  IAMUserForWebsiteManagementCredentialsStoredKey:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/Customers/${Customer}/${DomainName}-manager/AccessKeyId'
+      Type: SecureString
+      Value: 
+        !Sub '${IAMUserForWebsiteManagementCredentials}'
+      Tags:
+        "Solution": !Ref DomainName
+        "Customer": !Ref Customer
+
+  IAMUserForWebsiteManagementCredentialsStoredSecret:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/Customers/${Customer}/${DomainName}-manager/SecretAccessKey'
+      Type: SecureString
+      Value: 
+        Fn::GetAtt: [IAMUserForWebsiteManagementCredentials, SecretAccessKey]
+      Tags:
+        "Solution": !Ref DomainName
+        "Customer": !Ref Customer
+
+Outputs:
+  WebsiteURL:
+    Description: "URL of the S3 bucket to access the website"
+    Value: !GetAtt WebsiteBucket.WebsiteURL
+  CloudFrontDistributionDomainName:
+    Description: "Domain name of the CloudFront distribution"
+    Value: !GetAtt CloudFrontDistribution.DomainName
+  HostedZoneID:
+    Condition: CreateNewHostedZone
+    Description: "The ID of the created hosted zone"
+    Value: !If [CreateNewHostedZone, !Ref ConditionallyCreatedHostedZone, "Existing hosted zone not created by this stack"]
+  HostedZoneNameServers:
+    Condition: CreateNewHostedZone
+    Description: "The nameservers for the created hosted zone"
+    Value: !If [CreateNewHostedZone, !Join [ ", ", !GetAtt ConditionallyCreatedHostedZone.NameServers ], "Existing hosted zone not created by this stack"]
+
