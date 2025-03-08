@@ -223,9 +223,9 @@ Resources:
         - !Ref SubnetId2
       MixedInstancesPolicy:
         InstancesDistribution:
-          OnDemandAllocationStrategy: "lowestPrice"
+          OnDemandAllocationStrategy: "lowest-price"
           OnDemandBaseCapacity: 0
-          SpotAllocationStrategy: "lowestPrice"
+          SpotAllocationStrategy: "lowest-price"
           SpotInstancePools: 2
         LaunchTemplate:
           LaunchTemplateSpecification:
