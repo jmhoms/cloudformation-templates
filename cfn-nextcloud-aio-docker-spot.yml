@@ -34,6 +34,8 @@ Parameters:
 Mappings:
   RegionMap:
     eu-west-1:
+      AMI: "ami-03fd334507439f4d1" # 24.04 LTS 64bit x86
+    us-east-1:
       AMI: "ami-04b4f1a9cf54c11d0" # 24.04 LTS 64bit x86
     # Add mappings for your region as needed
 
