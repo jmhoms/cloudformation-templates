@@ -191,11 +191,25 @@ Resources:
                 systemctl start docker
         
                 # 3) Assign Elastic IP (EIP) to the instance
-                INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
+                # Retrieve the instance ID using IMDSv2, fallback to v1 if token can't be obtained
+                TOKEN=$(curl -X PUT -s -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" "http://169.254.169.254/latest/api/token" || true)
+                
+                if [ -n "$TOKEN" ]; then
+                  # If we got a token, use IMDSv2
+                  INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" "http://169.254.169.254/latest/meta-data/instance-id")
+                else
+                  # Fall back to IMDSv1
+                  INSTANCE_ID=$(curl -s "http://169.254.169.254/latest/meta-data/instance-id")
+                fi
+                
+                # For debugging, you can log:
+                echo "Retrieved INSTANCE_ID as $INSTANCE_ID"
+                
+                # Now associate the EIP
                 aws ec2 associate-address \
-                  --allocation-id ${EIPAllocationId} \
-                  --instance-id $INSTANCE_ID \
-                  --region ${AWS::Region} \
+                  --allocation-id ALLOC_ID_HERE \
+                  --instance-id "$INSTANCE_ID" \
+                  --region YOUR_REGION \
                   --allow-reassociation
         
                 # 4) Install NFS utilities (Required for mounting EFS)
