@@ -166,29 +166,47 @@ Resources:
             Fn::Sub:
               - |
                 #!/bin/bash
+                set -euxo pipefail  # Enable debugging, exit on error
+        
+                # Log output for debugging
+                exec > /var/log/user-data.log 2>&1
+        
+                # Update system
                 apt-get update -y
-                # If you want amazon-efs-utils:
-                # apt-get install -y docker.io docker-compose awscli amazon-efs-utils
-                # If you prefer plain nfs:
-                apt-get install -y docker.io docker-compose awscli nfs-common
-
+        
+                # 1) Install AWS CLI (new method for Ubuntu 24.04)
+                snap install aws-cli --classic
+        
+                # 2) Install Docker correctly from the official Docker repository
+                apt-get install -y ca-certificates curl gnupg
+                install -m 0755 -d /etc/apt/keyrings
+                curl -fsSL https://download.docker.com/linux/ubuntu/gpg | tee /etc/apt/keyrings/docker.asc > /dev/null
+                chmod a+r /etc/apt/keyrings/docker.asc
+                echo "deb [signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+                apt-get update -y
+                apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+        
+                # Enable and start Docker
                 systemctl enable docker
                 systemctl start docker
-
-                # Reassign the EIP to this instance
+        
+                # 3) Assign Elastic IP (EIP) to the instance
                 INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
                 aws ec2 associate-address \
                   --allocation-id ${EIPAllocationId} \
                   --instance-id $INSTANCE_ID \
                   --region ${AWS::Region} \
                   --allow-reassociation
-
-                # Mount EFS
+        
+                # 4) Install NFS utilities (Required for mounting EFS)
+                apt-get install -y nfs-common
+        
+                # 5) Mount EFS
                 mkdir -p /mnt/nextcloud
                 echo "${EFSId}.efs.${AWS::Region}.amazonaws.com:/ /mnt/nextcloud nfs4 defaults 0 0" >> /etc/fstab
                 mount -a
-
-                # Run Nextcloud AIO container
+        
+                # 6) Run Nextcloud AIO container
                 docker run \
                   --restart always \
                   -d \
@@ -199,8 +217,7 @@ Resources:
                   -v nextcloud_aio_mastercontainer:/mnt/docker-aio-config \
                   --privileged \
                   nextcloud/all-in-one:latest
-
-              # Substitution variables
+        
               - {
                   EIPAllocationId: !GetAtt NextcloudEIP.AllocationId,
                   EFSId: !Ref NextcloudEFS
