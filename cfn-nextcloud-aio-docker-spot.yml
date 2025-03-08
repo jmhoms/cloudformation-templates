@@ -1,0 +1,259 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Nextcloud All-in-One on a Spot instance with:
+    - EFS for persistent data
+    - Automatic EIP reassignment for stable public IP
+    - Narrow IAM policy for just ec2:AssociateAddress, efs:ClientMount, etc.
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID to deploy into
+  SubnetId1:
+    Type: AWS::EC2::Subnet::Id
+    Description: Subnet #1 in which the Spot instance can launch
+  SubnetId2:
+    Type: AWS::EC2::Subnet::Id
+    Description: Subnet #2 for the EFS mount target and ASG redundancy
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: EC2 Key Pair for SSH access (optional but recommended)
+  InstanceType:
+    Type: String
+    Default: t3.small
+    Description: EC2 Spot instance type
+  DesiredCapacity:
+    Type: Number
+    Default: 1
+    Description: How many Nextcloud AIO instances to run (spot)
+  MaxCapacity:
+    Type: Number
+    Default: 1
+    Description: Maximum number of instances
+
+Mappings:
+  RegionMap:
+    us-east-1:
+      AMI: "ami-0b0dcb5067f052a63"  # Example Ubuntu 20.04 or 22.04
+    us-west-2:
+      AMI: "ami-0ee23bfc74a881de5"
+    # Add mappings for your region as needed
+
+Resources:
+  ####################################################
+  # Security Group
+  ####################################################
+  NextcloudSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP/HTTPS to Nextcloud
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+
+  ####################################################
+  # EFS Filesystem + Mount Targets
+  ####################################################
+  NextcloudEFS:
+    Type: AWS::EFS::FileSystem
+    Properties:
+      Encrypted: true
+      FileSystemTags:
+        - Key: Name
+          Value: NextcloudEFS
+
+  NextcloudEFSMountTarget1:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref NextcloudEFS
+      SubnetId: !Ref SubnetId1
+      SecurityGroups:
+        - !Ref NextcloudSecurityGroup
+
+  NextcloudEFSMountTarget2:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref NextcloudEFS
+      SubnetId: !Ref SubnetId2
+      SecurityGroups:
+        - !Ref NextcloudSecurityGroup
+
+  ####################################################
+  # Elastic IP (EIP) - stable public IP
+  ####################################################
+  NextcloudEIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: NextcloudEIP
+
+  ####################################################
+  # IAM Role & Instance Profile (Narrow Permissions)
+  ####################################################
+  NextcloudRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: 
+                - ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Path: "/"
+
+  NextcloudPolicies:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: NextcloudEC2EFSAccess
+      Roles:
+        - !Ref NextcloudRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # 1) Let the instance reattach the EIP.
+          - Effect: Allow
+            Action:
+              - ec2:AssociateAddress
+              - ec2:DisassociateAddress
+            Resource: '*'
+
+          # 2) Minimal EFS Client Access
+          # If you're purely using 'nfs-common' with an NFS mount, you might not need these.
+          # But if you use 'amazon-efs-utils' or TLS mounting, you need them.
+          - Effect: Allow
+            Action:
+              - efs:ClientMount
+              - efs:ClientRootAccess
+              - efs:DescribeMountTargets
+            Resource: '*'
+
+  NextcloudInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref NextcloudRole
+
+  ####################################################
+  # Launch Template
+  ####################################################
+  NextcloudLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        IamInstanceProfile:
+          Arn: !GetAtt NextcloudInstanceProfile.Arn
+        ImageId: !FindInMap [RegionMap, !Ref "AWS::Region", AMI]
+        InstanceType: !Ref InstanceType
+        KeyName: !Ref KeyName
+        SecurityGroupIds:
+          - !Ref NextcloudSecurityGroup
+        UserData:
+          Fn::Base64:
+            Fn::Sub:
+              - |
+                #!/bin/bash
+                apt-get update -y
+                # If you want amazon-efs-utils:
+                # apt-get install -y docker.io docker-compose awscli amazon-efs-utils
+                # If you prefer plain nfs:
+                apt-get install -y docker.io docker-compose awscli nfs-common
+
+                systemctl enable docker
+                systemctl start docker
+
+                # Reassign the EIP to this instance
+                INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
+                aws ec2 associate-address \
+                  --allocation-id ${EIPAllocationId} \
+                  --instance-id $INSTANCE_ID \
+                  --region ${AWS::Region} \
+                  --allow-reassociation
+
+                # Mount EFS
+                mkdir -p /mnt/nextcloud
+                echo "${EFSId}.efs.${AWS::Region}.amazonaws.com:/ /mnt/nextcloud nfs4 defaults 0 0" >> /etc/fstab
+                mount -a
+
+                # Run Nextcloud AIO container
+                docker run \
+                  --restart always \
+                  -d \
+                  --name nextcloud-aio-mastercontainer \
+                  -p 80:80 \
+                  -p 443:443 \
+                  -e NEXTCLOUD_DATADIR="/mnt/nextcloud" \
+                  -v nextcloud_aio_mastercontainer:/mnt/docker-aio-config \
+                  --privileged \
+                  nextcloud/all-in-one:latest
+
+              # Substitution variables
+              - {
+                  EIPAllocationId: !GetAtt NextcloudEIP.AllocationId,
+                  EFSId: !Ref NextcloudEFS
+                }
+      VersionDescription: NextcloudAIO
+      TagSpecifications:
+        - ResourceType: launch-template
+          Tags:
+            - Key: Name
+              Value: NextcloudAIO
+
+  ####################################################
+  # Auto Scaling Group (Spot Instances)
+  ####################################################
+  NextcloudASG:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier:
+        - !Ref SubnetId1
+        - !Ref SubnetId2
+      MixedInstancesPolicy:
+        InstancesDistribution:
+          OnDemandAllocationStrategy: "lowestPrice"
+          OnDemandBaseCapacity: 0
+          SpotAllocationStrategy: "lowestPrice"
+          SpotInstancePools: 2
+        LaunchTemplate:
+          LaunchTemplateSpecification:
+            LaunchTemplateId: !Ref NextcloudLaunchTemplate
+            Version: !GetAtt NextcloudLaunchTemplate.LatestVersionNumber
+          Overrides: []
+      MinSize: 0
+      DesiredCapacity: !Ref DesiredCapacity
+      MaxSize: !Ref MaxCapacity
+      Tags:
+        - Key: Name
+          Value: NextcloudAIO
+          PropagateAtLaunch: true
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        PauseTime: PT0S
+        MaxBatchSize: 1
+        MinInstancesInService: 0
+
+Outputs:
+  EFSFileSystemId:
+    Description: EFS FileSystem ID
+    Value: !Ref NextcloudEFS
+
+  NextcloudASGName:
+    Description: Auto Scaling Group Name
+    Value: !Ref NextcloudASG
+
+  NextcloudEIPAllocationId:
+    Description: Allocation ID of the EIP
+    Value: !GetAtt NextcloudEIP.AllocationId
