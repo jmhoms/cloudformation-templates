@@ -33,10 +33,8 @@ Parameters:
 
 Mappings:
   RegionMap:
-    us-east-1:
-      AMI: "ami-0b0dcb5067f052a63"  # Example Ubuntu 20.04 or 22.04
-    us-west-2:
-      AMI: "ami-0ee23bfc74a881de5"
+    eu-west-1:
+      AMI: "ami-04b4f1a9cf54c11d0" # 24.04 LTS 64bit x86
     # Add mappings for your region as needed
 
 Resources:
