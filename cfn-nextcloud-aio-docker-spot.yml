@@ -23,7 +23,7 @@ Parameters:
     Description: EC2 Key Pair for SSH access
   InstanceType:
     Type: String
-    Default: t3.small
+    Default: t3a.medium
     Description: EC2 Spot instance type
   DesiredCapacity:
     Type: Number
@@ -241,8 +241,7 @@ Resources:
                   --restart always \
                   -d \
                   --name nextcloud-aio-mastercontainer \
-                  -p 80:80 \
-                  -p 443:443 \
+                  -p 8080:8080 \
                   -e NEXTCLOUD_DATADIR="/mnt/nextcloud" \
                   -v nextcloud_aio_mastercontainer:/mnt/docker-aio-config \
                   -v /var/run/docker.sock:/var/run/docker.sock:ro \
