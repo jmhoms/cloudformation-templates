@@ -201,14 +201,13 @@ Resources:
               VolumeSize: 40  # Set root volume size to 40GB
               VolumeType: gp3  # Use gp3 (cheaper and better than gp2)
               DeleteOnTermination: true
-              Encrypted: true              
+              Encrypted: true                      
         UserData:
           Fn::Base64:
             Fn::Sub:
               - |
                 #!/bin/bash
                 set -euxo pipefail
-
                 exec > /var/log/user-data.log 2>&1
 
                 # 1) Retrieve IMDSv2 token for instance ID
@@ -221,7 +220,21 @@ Resources:
                 fi
                 echo "Retrieved INSTANCE_ID as $INSTANCE_ID"
 
-                # 2) Install Docker & AWS CLI
+                # 2) Associate the Elastic IP to this instance
+                aws ec2 associate-address \
+                  --allocation-id ${EIPAllocationId} \
+                  --instance-id "$INSTANCE_ID" \
+                  --region ${AWS::Region} \
+                  --allow-reassociation
+
+                # 3) Wait for network to be fully available
+                for i in {1..10}; do
+                  curl -s --head https://wwww.google.com/ && break
+                  echo "Waiting for network to be ready..."
+                  sleep 5
+                done
+
+                # 4) Install Docker & AWS CLI
                 apt-get update -y
                 snap install aws-cli --classic
 
@@ -236,19 +249,19 @@ Resources:
                 systemctl enable docker
                 systemctl start docker
 
-                # 3) Associate the Elastic IP to this instance
-                aws ec2 associate-address \
-                  --allocation-id ${EIPAllocationId} \
-                  --instance-id "$INSTANCE_ID" \
-                  --region ${AWS::Region} \
-                  --allow-reassociation
-
-                # 4) Mount EFS
+                # 5) Mount EFS
                 mkdir -p /mnt/nextcloud
                 echo "${EFSId}.efs.${AWS::Region}.amazonaws.com:/ /mnt/nextcloud nfs4 defaults 0 0" >> /etc/fstab
                 mount -a || echo "Warning: EFS mount attempt failed. Check logs."
 
-                # 5) Run Nextcloud All-in-One container
+                # 6) Retry pulling the Nextcloud image if it fails
+                for i in {1..5}; do
+                  docker pull nextcloud/all-in-one:latest && break
+                  echo "Docker pull failed, retrying in 10 seconds..."
+                  sleep 10
+                done
+
+                # 7) Run Nextcloud All-in-One container
                 docker run \
                   --restart always \
                   -d \
