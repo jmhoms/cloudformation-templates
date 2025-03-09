@@ -1,11 +1,12 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
-  Nextcloud All-in-One on a Spot instance with:
+  Nextcloud All-in-One on a Spot instance:
     - EFS for persistent data
     - Automatic EIP reassignment for stable public IP
-    - Two separate security groups (one for EC2, one for EFS)
+    - Two separate security groups (EC2 vs. EFS)
     - Narrow IAM policy for only ec2:AssociateAddress, efs:ClientMount, etc.
     - IMDSv2 for retrieving INSTANCE_ID
+    - "lowest-price" Spot allocation strategy
 
 Parameters:
   VpcId:
@@ -13,7 +14,7 @@ Parameters:
     Description: VPC ID to deploy into
   SubnetId1:
     Type: AWS::EC2::Subnet::Id
-    Description: Subnet #1 (AZ1) for the Spot instance / EFS mount target
+    Description: Subnet #1 (AZ1) for the Spot instance and EFS mount target
   SubnetId2:
     Type: AWS::EC2::Subnet::Id
     Description: Subnet #2 (AZ2) for redundancy
@@ -34,20 +35,19 @@ Parameters:
     Description: Maximum number of instances
 
 Mappings:
+  # Update with valid Ubuntu or other AMI in your region
   RegionMap:
-    # Provide AMIs for your region(s):
     eu-west-1:
-      AMI: "ami-0c55b159cbfafe1f0"  # Example Ubuntu 22.04, might vary
+      AMI: "ami-0c55b159cbfafe1f0"  # Example Ubuntu 22.04 for eu-west-1
     us-east-1:
       AMI: "ami-0b0dcb5067f052a63"
-    # Add more region mappings as needed
+    # Add additional regions as needed
 
 Resources:
   ####################################################
   # 1) Security Groups
   ####################################################
 
-  # SG for the EC2 instance
   NextcloudInstanceSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
@@ -69,14 +69,13 @@ Resources:
         - IpProtocol: -1
           CidrIp: 0.0.0.0/0
 
-  # SG for EFS
   NextcloudEFSSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: EFS SG (allow NFS from the EC2 SG)
+      GroupDescription: EFS SG (allow NFS only from EC2 SG)
       VpcId: !Ref VpcId
       SecurityGroupIngress:
-        # Inbound 2049 from the instance SG only
+        # Inbound 2049 from the instance SG
         - IpProtocol: tcp
           FromPort: 2049
           ToPort: 2049
@@ -149,14 +148,14 @@ Resources:
       PolicyDocument:
         Version: '2012-10-17'
         Statement:
-          # 1) Let the instance reattach the EIP.
+          # Let the instance reattach the EIP
           - Effect: Allow
             Action:
               - ec2:AssociateAddress
               - ec2:DisassociateAddress
             Resource: '*'
 
-          # 2) Minimal EFS Client Access
+          # Minimal EFS Client Access
           - Effect: Allow
             Action:
               - efs:ClientMount
@@ -175,6 +174,9 @@ Resources:
   ####################################################
   NextcloudLaunchTemplate:
     Type: AWS::EC2::LaunchTemplate
+    DependsOn:
+      - NextcloudEFS
+      - NextcloudEIP
     Properties:
       LaunchTemplateData:
         IamInstanceProfile:
@@ -184,77 +186,77 @@ Resources:
         KeyName: !Ref KeyName
         SecurityGroupIds:
           - !Ref NextcloudInstanceSecurityGroup
-        # Optional: specify IMDSv2 required. If you want to enforce IMDSv2:
         MetadataOptions:
           HttpTokens: required
           HttpEndpoint: enabled
           HttpPutResponseHopLimit: 2
         UserData:
           Fn::Base64:
-            Fn::Sub: |
-              #!/bin/bash
-              set -euxo pipefail
+            Fn::Sub:
+              - |
+                #!/bin/bash
+                set -euxo pipefail
 
-              exec > /var/log/user-data.log 2>&1
+                exec > /var/log/user-data.log 2>&1
 
-              # 1) Retrieve IMDSv2 token
-              TOKEN=$(curl -X PUT -s -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" http://169.254.169.254/latest/api/token || true)
-              if [ -n "$TOKEN" ]; then
-                INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" "http://169.254.169.254/latest/meta-data/instance-id")
-              else
-                # fallback to IMDSv1 (if optional)
-                INSTANCE_ID=$(curl -s "http://169.254.169.254/latest/meta-data/instance-id")
-              fi
-              echo "Retrieved INSTANCE_ID as $INSTANCE_ID"
+                # 1) Retrieve IMDSv2 token for instance ID
+                TOKEN=$(curl -X PUT -s -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" http://169.254.169.254/latest/api/token || true)
+                if [ -n "$TOKEN" ]; then
+                  INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
+                else
+                  # fallback to IMDSv1 if it's optional
+                  INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
+                fi
+                echo "Retrieved INSTANCE_ID as $INSTANCE_ID"
 
-              # 2) Update system, install Docker & AWS CLI
-              apt-get update -y
-              snap install aws-cli --classic
+                # 2) Install Docker & AWS CLI
+                apt-get update -y
+                snap install aws-cli --classic
 
-              apt-get install -y ca-certificates curl gnupg nfs-common
-              install -m 0755 -d /etc/apt/keyrings
-              curl -fsSL https://download.docker.com/linux/ubuntu/gpg | tee /etc/apt/keyrings/docker.asc > /dev/null
-              chmod a+r /etc/apt/keyrings/docker.asc
-              echo "deb [signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
-              apt-get update -y
-              apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+                apt-get install -y ca-certificates curl gnupg nfs-common
+                install -m 0755 -d /etc/apt/keyrings
+                curl -fsSL https://download.docker.com/linux/ubuntu/gpg | tee /etc/apt/keyrings/docker.asc > /dev/null
+                chmod a+r /etc/apt/keyrings/docker.asc
+                echo "deb [signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+                apt-get update -y
+                apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
 
-              systemctl enable docker
-              systemctl start docker
+                systemctl enable docker
+                systemctl start docker
 
-              # 3) Associate EIP
-              aws ec2 associate-address \
-                --allocation-id ${EIPAllocationId} \
-                --instance-id "$INSTANCE_ID" \
-                --region ${AWS::Region} \
-                --allow-reassociation
+                # 3) Associate the Elastic IP to this instance
+                aws ec2 associate-address \
+                  --allocation-id ${EIPAllocationId} \
+                  --instance-id "$INSTANCE_ID" \
+                  --region ${AWS::Region} \
+                  --allow-reassociation
 
-              # 4) Mount EFS
-              mkdir -p /mnt/nextcloud
-              echo "${EFSId}.efs.${AWS::Region}.amazonaws.com:/ /mnt/nextcloud nfs4 defaults 0 0" >> /etc/fstab
-              mount -a || echo "EFS mount attempt failed, check logs"
+                # 4) Mount EFS
+                mkdir -p /mnt/nextcloud
+                echo "${EFSId}.efs.${AWS::Region}.amazonaws.com:/ /mnt/nextcloud nfs4 defaults 0 0" >> /etc/fstab
+                mount -a || echo "Warning: EFS mount attempt failed. Check logs."
 
-              # 5) Start Nextcloud AIO
-              docker run \
-                --restart always \
-                -d \
-                --name nextcloud-aio-mastercontainer \
-                -p 80:80 \
-                -p 443:443 \
-                -e NEXTCLOUD_DATADIR="/mnt/nextcloud" \
-                -v nextcloud_aio_mastercontainer:/mnt/docker-aio-config \
-                --privileged \
-                nextcloud/all-in-one:latest
+                # 5) Run Nextcloud All-in-One container
+                docker run \
+                  --restart always \
+                  -d \
+                  --name nextcloud-aio-mastercontainer \
+                  -p 80:80 \
+                  -p 443:443 \
+                  -e NEXTCLOUD_DATADIR="/mnt/nextcloud" \
+                  -v nextcloud_aio_mastercontainer:/mnt/docker-aio-config \
+                  --privileged \
+                  nextcloud/all-in-one:latest
+              - {
+                  EIPAllocationId: !GetAtt NextcloudEIP.AllocationId,
+                  EFSId: !Ref NextcloudEFS
+                }
       VersionDescription: NextcloudAIO
       TagSpecifications:
         - ResourceType: launch-template
           Tags:
             - Key: Name
               Value: NextcloudAIO
-    # No direct references to EIP/EFS in the LT, we pass them in the user data with Fn::Sub:
-    # Sub variables:
-    # - EIPAllocationId
-    # - EFSId
 
   ####################################################
   # 6) Auto Scaling Group (Spot)
