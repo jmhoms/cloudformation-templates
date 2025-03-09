@@ -190,6 +190,13 @@ Resources:
           HttpTokens: required
           HttpEndpoint: enabled
           HttpPutResponseHopLimit: 2
+        BlockDeviceMappings:
+          - DeviceName: "/dev/xvda"  # Root disk
+            Ebs:
+              VolumeSize: 40  # Set root volume size to 40GB
+              VolumeType: gp3  # Use gp3 (cheaper and better than gp2)
+              DeleteOnTermination: true
+              Encrypted: true  
         UserData:
           Fn::Base64:
             Fn::Sub:
