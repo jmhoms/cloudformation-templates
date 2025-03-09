@@ -210,15 +210,12 @@ Resources:
           HttpEndpoint: enabled
           HttpPutResponseHopLimit: 2
         BlockDeviceMappings:
-          - DeviceName: !FindInMap
-              - InstanceTypeToRootDevice
-              - !Ref InstanceType
-              - DeviceName
+          - DeviceName: !Ref AWS::EC2::Instance.RootDeviceName  # Uses the AMI’s root device
             Ebs:
-              VolumeSize: 40 # Set root volume size to 40GB
-              VolumeType: gp3 # Use gp3 (cheaper and better than gp2)
+              VolumeSize: 40  # Set root volume size to 40GB
+              VolumeType: gp3  # Use gp3 (cheaper and better than gp2)
               DeleteOnTermination: true
-              Encrypted: true   
+              Encrypted: true              
         UserData:
           Fn::Base64:
             Fn::Sub:
