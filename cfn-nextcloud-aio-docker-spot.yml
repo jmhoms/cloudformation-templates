@@ -38,9 +38,9 @@ Mappings:
   # Update with valid Ubuntu or other AMI in your region
   RegionMap:
     eu-west-1:
-      AMI: "ami-0c55b159cbfafe1f0"  # Example Ubuntu 22.04 for eu-west-1
+      AMI: "ami-03fd334507439f4d1" # 24.04 LTS 64bit x86
     us-east-1:
-      AMI: "ami-0b0dcb5067f052a63"
+      AMI: "ami-04b4f1a9cf54c11d0" # 24.04 LTS 64bit x86
     # Add additional regions as needed
 
 Resources:
