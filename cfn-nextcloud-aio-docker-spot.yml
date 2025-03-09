@@ -42,6 +42,25 @@ Mappings:
     us-east-1:
       AMI: "ami-04b4f1a9cf54c11d0" # 24.04 LTS 64bit x86
     # Add additional regions as needed
+  InstanceTypeToRootDevice:
+    default:
+      DeviceName: "/dev/nvme0n1"
+    t2.micro:
+      DeviceName: "/dev/xvda"
+    t2.small:
+      DeviceName: "/dev/xvda"
+    t3a.small:
+      DeviceName: "/dev/xvda"
+    t3a.medium:
+      DeviceName: "/dev/xvda"
+    t3.small:
+      DeviceName: "/dev/nvme0n1"
+    t3.medium:
+      DeviceName: "/dev/nvme0n1"
+    t4g.small:
+      DeviceName: "/dev/nvme0n1"
+    t4g.medium:
+      DeviceName: "/dev/nvme0n1"
 
 Resources:
   ####################################################
@@ -191,12 +210,15 @@ Resources:
           HttpEndpoint: enabled
           HttpPutResponseHopLimit: 2
         BlockDeviceMappings:
-          - DeviceName: "/dev/xvda"  # Root disk
+          - DeviceName: !FindInMap
+              - InstanceTypeToRootDevice
+              - !Ref InstanceType
+              - DeviceName
             Ebs:
-              VolumeSize: 40  # Set root volume size to 40GB
-              VolumeType: gp3  # Use gp3 (cheaper and better than gp2)
+              VolumeSize: 40 # Set root volume size to 40GB
+              VolumeType: gp3 # Use gp3 (cheaper and better than gp2)
               DeleteOnTermination: true
-              Encrypted: true  
+              Encrypted: true   
         UserData:
           Fn::Base64:
             Fn::Sub:
