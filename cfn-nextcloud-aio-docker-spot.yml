@@ -117,6 +117,23 @@ Resources:
       SecurityGroups:
         - !Ref NextcloudEFSSecurityGroup
 
+  NextcloudDockerEFS:
+    Type: AWS::EFS::FileSystem
+    Properties:
+      Encrypted: true
+      PerformanceMode: generalPurpose
+      ThroughputMode: bursting
+      LifecyclePolicies:
+        - TransitionToIA: AFTER_30_DAYS
+
+  NextcloudDockerEFSMountTarget:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref NextcloudDockerEFS
+      SubnetId: !Ref SubnetId
+      SecurityGroups:
+        - !Ref NextcloudEFSSecurityGroup
+
   ####################################################
   # 3) Elastic IP (EIP)
   ####################################################
@@ -202,6 +219,69 @@ Resources:
               VolumeType: gp3  # Use gp3 (cheaper and better than gp2)
               DeleteOnTermination: true
               Encrypted: true                      
+
+        UserData:
+          Fn::Base64:
+            Fn::Sub: |
+              #!/bin/bash
+              set -euxo pipefail
+        
+              exec > /var/log/user-data.log 2>&1
+        
+              # Install dependencies
+              apt-get update -y
+              snap install aws-cli --classic
+              apt-get install -y ca-certificates curl gnupg nfs-common
+        
+              # Create mount points
+              mkdir -p /mnt/nextcloud
+              mkdir -p /mnt/docker
+        
+              # Mount Nextcloud user data
+              echo "${NextcloudEFS}.efs.${AWS::Region}.amazonaws.com:/ /mnt/nextcloud nfs4 defaults 0 0" >> /etc/fstab
+              mount -a
+        
+              # Mount Docker data
+              echo "${NextcloudDockerEFS}.efs.${AWS::Region}.amazonaws.com:/ /mnt/docker nfs4 defaults 0 0" >> /etc/fstab
+              mount -a
+        
+              # Stop Docker before changing storage location
+              systemctl stop docker || true
+        
+              # Move existing Docker storage to the new EFS volume
+              if [ ! -d "/mnt/docker/docker" ]; then
+                  mkdir -p /mnt/docker/docker
+                  mv /var/lib/docker /mnt/docker/docker
+              fi
+        
+              # Update Docker configuration to use the EFS volume
+              mkdir -p /etc/docker
+              echo '{ "data-root": "/mnt/docker/docker" }' > /etc/docker/daemon.json
+        
+              # Restart Docker with the new storage location
+              systemctl start docker
+        
+              # Retry Docker image pull to handle network delays
+              for i in {1..5}; do
+                docker pull nextcloud/all-in-one:latest && break
+                echo "Docker pull failed, retrying in 10 seconds..."
+                sleep 10
+              done
+        
+              # Start Nextcloud AIO
+              docker run \
+                --restart always \
+                -d \
+                --name nextcloud-aio-mastercontainer \
+                -p 8080:8080 \
+                -e NEXTCLOUD_DATADIR="/mnt/nextcloud" \
+                -v nextcloud_aio_mastercontainer:/mnt/docker-aio-config \
+                -v /var/run/docker.sock:/var/run/docker.sock:ro \
+                --privileged \
+                nextcloud/all-in-one:latest
+
+        
+        
         UserData:
           Fn::Base64:
             Fn::Sub:
@@ -245,23 +325,40 @@ Resources:
                 echo "deb [signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
                 apt-get update -y
                 apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
-
                 systemctl enable docker
-                systemctl start docker
 
                 # 5) Mount EFS
                 mkdir -p /mnt/nextcloud
                 echo "${EFSId}.efs.${AWS::Region}.amazonaws.com:/ /mnt/nextcloud nfs4 defaults 0 0" >> /etc/fstab
+                mkdir -p /mnt/docker
+                echo "${NextcloudDockerEFS}.efs.${AWS::Region}.amazonaws.com:/ /mnt/docker nfs4 defaults 0 0" >> /etc/fstab
                 mount -a || echo "Warning: EFS mount attempt failed. Check logs."
 
-                # 6) Retry pulling the Nextcloud image if it fails
+                # 6) Change Docker storage location
+                # Stop Docker
+                systemctl stop docker || true
+          
+                # Move existing Docker storage to the new EFS volume
+                if [ ! -d "/mnt/docker/docker" ]; then
+                    mkdir -p /mnt/docker/docker
+                    mv /var/lib/docker /mnt/docker/docker
+                fi
+          
+                # Update Docker configuration to use the EFS volume
+                mkdir -p /etc/docker
+                echo '{ "data-root": "/mnt/docker/docker" }' > /etc/docker/daemon.json
+          
+                # Restart Docker with the new storage location
+                systemctl start docker
+
+                # 7) Retry pulling the Nextcloud image if it fails
                 for i in {1..5}; do
                   docker pull nextcloud/all-in-one:latest && break
                   echo "Docker pull failed, retrying in 10 seconds..."
                   sleep 10
                 done
 
-                # 7) Run Nextcloud All-in-One container
+                # 8) Run Nextcloud All-in-One container
                 docker run \
                   --restart always \
                   -d \
