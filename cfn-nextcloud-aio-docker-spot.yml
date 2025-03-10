@@ -1,10 +1,11 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
   Nextcloud All-in-One on a Spot instance:
-    - EFS for persistent data
-    - Automatic EIP reassignment for stable public IP
-    - Two separate security groups (EC2 vs. EFS)
-    - Narrow IAM policy for only ec2:AssociateAddress, efs:ClientMount, etc.
+    - Single AZ
+    - EFS for Nextcloud user files
+    - EBS volume for Docker data (to survive Spot terminations)
+    - Restricted IAM policy scoping
+    - Automatic EIP reassignment
     - IMDSv2 for retrieving INSTANCE_ID
     - "lowest-price" Spot allocation strategy
 
@@ -12,65 +13,70 @@ Parameters:
   VpcId:
     Type: AWS::EC2::VPC::Id
     Description: VPC ID to deploy into
-  SubnetId1:
+
+  SubnetId:
     Type: AWS::EC2::Subnet::Id
-    Description: Subnet #1 (AZ1) for the Spot instance and EFS mount target
-  SubnetId2:
-    Type: AWS::EC2::Subnet::Id
-    Description: Subnet #2 (AZ2) for redundancy
+    Description: Subnet in the same AZ as the EBS volume (single-AZ deployment)
+
+  SubnetAZ:
+    Type: String
+    Description: Availability Zone of the above Subnet (e.g., "eu-west-1a")
+
   KeyName:
     Type: AWS::EC2::KeyPair::KeyName
     Description: EC2 Key Pair for SSH access
+
   InstanceType:
     Type: String
     Default: t3a.medium
     Description: EC2 Spot instance type
+
   DesiredCapacity:
     Type: Number
     Default: 1
-    Description: How many Nextcloud AIO instances to run on Spot
+    Description: Desired number of Nextcloud instances
+
   MaxCapacity:
     Type: Number
     Default: 1
-    Description: Maximum number of instances
+    Description: Max number of Nextcloud instances in the ASG
+
+  DockerVolumeSize:
+    Type: Number
+    Default: 30
+    Description: Size (GB) of the EBS volume for Docker
 
 Mappings:
-  # Update with valid Ubuntu in your region
+  # Update with valid Ubuntu AMIs in your region.
   RegionMap:
     eu-west-1:
-      AMI: "ami-03fd334507439f4d1" # 24.04 LTS 64bit x86
+      AMI: "ami-03fd334507439f4d1"  # Ubuntu 24.04 LTS x86
     us-east-1:
-      AMI: "ami-04b4f1a9cf54c11d0" # 24.04 LTS 64bit x86
-    # Add additional regions as needed
+      AMI: "ami-04b4f1a9cf54c11d0"  # Ubuntu 24.04 LTS x86
 
 Resources:
   ####################################################
   # 1) Security Groups
   ####################################################
-
   NextcloudInstanceSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Nextcloud Instance SG (allow 80/443 inbound)
+      GroupDescription: Nextcloud Instance SG (HTTP/HTTPS/8080 inbound)
       VpcId: !Ref VpcId
       SecurityGroupIngress:
-        # HTTP from anywhere
         - IpProtocol: tcp
           FromPort: 8080
           ToPort: 8080
           CidrIp: 0.0.0.0/0
-        # HTTP from anywhere
         - IpProtocol: tcp
           FromPort: 80
           ToPort: 80
           CidrIp: 0.0.0.0/0
-        # HTTPS from anywhere
         - IpProtocol: tcp
           FromPort: 443
           ToPort: 443
           CidrIp: 0.0.0.0/0
       SecurityGroupEgress:
-        # Allow all outbound
         - IpProtocol: -1
           CidrIp: 0.0.0.0/0
 
@@ -80,18 +86,16 @@ Resources:
       GroupDescription: EFS SG (allow NFS only from EC2 SG)
       VpcId: !Ref VpcId
       SecurityGroupIngress:
-        # Inbound 2049 from the instance SG
         - IpProtocol: tcp
           FromPort: 2049
           ToPort: 2049
           SourceSecurityGroupId: !Ref NextcloudInstanceSecurityGroup
       SecurityGroupEgress:
-        # Allow all outbound
         - IpProtocol: -1
           CidrIp: 0.0.0.0/0
 
   ####################################################
-  # 2) EFS Filesystem & Mount Targets
+  # 2) EFS (Nextcloud user data)
   ####################################################
   NextcloudEFS:
     Type: AWS::EFS::FileSystem
@@ -101,53 +105,16 @@ Resources:
         - Key: Name
           Value: NextcloudEFS
 
-  NextcloudEFSMountTarget1:
+  NextcloudEFSMountTarget:
     Type: AWS::EFS::MountTarget
     Properties:
       FileSystemId: !Ref NextcloudEFS
-      SubnetId: !Ref SubnetId1
+      SubnetId: !Ref SubnetId
       SecurityGroups:
         - !Ref NextcloudEFSSecurityGroup
-
-  NextcloudEFSMountTarget2:
-    Type: AWS::EFS::MountTarget
-    Properties:
-      FileSystemId: !Ref NextcloudEFS
-      SubnetId: !Ref SubnetId2
-      SecurityGroups:
-        - !Ref NextcloudEFSSecurityGroup
-
-  NextcloudDockerEFS:
-    Type: AWS::EFS::FileSystem
-    Properties:
-      Encrypted: true
-      FileSystemTags:
-        - Key: Name
-          Value: NextcloudDockerEFS      
-      PerformanceMode: generalPurpose
-      ThroughputMode: bursting
-      LifecyclePolicies:
-        - TransitionToIA: AFTER_30_DAYS
-
-  NextcloudDockerEFSMountTarget1:
-    Type: AWS::EFS::MountTarget
-    Properties:
-      FileSystemId: !Ref NextcloudDockerEFS
-      SubnetId: !Ref SubnetId1
-      SecurityGroups:
-        - !Ref NextcloudEFSSecurityGroup
-
-  NextcloudDockerEFSMountTarget2:
-    Type: AWS::EFS::MountTarget
-    Properties:
-      FileSystemId: !Ref NextcloudDockerEFS
-      SubnetId: !Ref SubnetId2
-      SecurityGroups:
-        - !Ref NextcloudEFSSecurityGroup
-
 
   ####################################################
-  # 3) Elastic IP (EIP)
+  # 3) EIP (for stable public IP)
   ####################################################
   NextcloudEIP:
     Type: AWS::EC2::EIP
@@ -158,7 +125,22 @@ Resources:
           Value: NextcloudEIP
 
   ####################################################
-  # 4) IAM Role & Minimal Policy
+  # 4) EBS Volume for Docker
+  ####################################################
+  NextcloudDockerVolume:
+    Type: AWS::EC2::Volume
+    Properties:
+      AvailabilityZone: !Ref SubnetAZ
+      Size: !Ref DockerVolumeSize
+      VolumeType: gp3
+      Encrypted: true
+      # By default, the volume is deleted when the stack is removed
+      Tags:
+        - Key: Name
+          Value: NextcloudDockerVolume
+
+  ####################################################
+  # 5) IAM Role & Minimal Policy (scoped to specific resources)
   ####################################################
   NextcloudRole:
     Type: AWS::IAM::Role
@@ -168,34 +150,67 @@ Resources:
         Statement:
           - Effect: Allow
             Principal:
-              Service:
-                - ec2.amazonaws.com
+              Service: ec2.amazonaws.com
             Action: sts:AssumeRole
       Path: "/"
 
   NextcloudPolicies:
     Type: AWS::IAM::Policy
     Properties:
-      PolicyName: NextcloudEC2EFSAccess
+      PolicyName: NextcloudEC2Access
       Roles:
         - !Ref NextcloudRole
       PolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          # Let the instance reattach the EIP
-          - Effect: Allow
-            Action:
-              - ec2:AssociateAddress
-              - ec2:DisassociateAddress
-            Resource: '*'
-
-          # Minimal EFS Client Access
-          - Effect: Allow
-            Action:
-              - efs:ClientMount
-              - efs:ClientRootAccess
-              - efs:DescribeMountTargets
-            Resource: '*'
+        Fn::Sub:
+          - |
+            {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Sid": "AssociateEIP",
+                  "Effect": "Allow",
+                  "Action": [
+                    "ec2:AssociateAddress",
+                    "ec2:DisassociateAddress"
+                  ],
+                  "Resource": "arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:eip-allocation/${EIPAllocationId}"
+                },
+                {
+                  "Sid": "ManageEBSVolume",
+                  "Effect": "Allow",
+                  "Action": [
+                    "ec2:AttachVolume",
+                    "ec2:DescribeVolumes",
+                    "ec2:DescribeVolumeAttribute"
+                  ],
+                  "Resource": "arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:volume/${DockerVolumeId}"
+                },
+                {
+                  "Sid": "DescribeEC2",
+                  "Effect": "Allow",
+                  "Action": [
+                    "ec2:DescribeInstances",
+                    "ec2:DescribeAddresses"
+                  ],
+                  "Resource": "*"
+                },
+                {
+                  "Sid": "EFSClientAccess",
+                  "Effect": "Allow",
+                  "Action": [
+                    "efs:ClientMount",
+                    "efs:ClientRootAccess",
+                    "efs:DescribeMountTargets"
+                  ],
+                  "Resource": "arn:aws:elasticfilesystem:${AWS::Region}:${AWS::AccountId}:file-system/${EFSFileSystemId}"
+                }
+              ]
+            }
+          - {
+              EIPAllocationId: !GetAtt NextcloudEIP.AllocationId,
+              DockerVolumeId: !Ref NextcloudDockerVolume,
+              EFSFileSystemId: !Ref NextcloudEFS
+            }
 
   NextcloudInstanceProfile:
     Type: AWS::IAM::InstanceProfile
@@ -204,7 +219,7 @@ Resources:
         - !Ref NextcloudRole
 
   ####################################################
-  # 5) Launch Template (with IMDSv2 user data)
+  # 6) Launch Template (IMDSv2 + user data)
   ####################################################
   NextcloudLaunchTemplate:
     Type: AWS::EC2::LaunchTemplate
@@ -225,12 +240,12 @@ Resources:
           HttpEndpoint: enabled
           HttpPutResponseHopLimit: 2
         BlockDeviceMappings:
-          - DeviceName: "/dev/sda1"  # sda1 for Ubuntu/Windows, xvda for other Linux
+          - DeviceName: "/dev/sda1"
             Ebs:
-              VolumeSize: 40  # Set root volume size to 40GB
-              VolumeType: gp3  # Use gp3 (cheaper and better than gp2)
+              VolumeSize: 8
+              VolumeType: gp3
               DeleteOnTermination: true
-              Encrypted: true                              
+              Encrypted: true
         UserData:
           Fn::Base64:
             Fn::Sub:
@@ -239,90 +254,100 @@ Resources:
                 set -euxo pipefail
                 exec > /var/log/user-data.log 2>&1
 
-                # 1) Install AWS CLI and basic tools
+                # 1) Install AWS CLI & basic tools
                 apt-get update -y
                 snap install aws-cli --classic
                 apt-get install -y ca-certificates curl gnupg nfs-common
-                
-                # 2) Retrieve IMDSv2 token for instance ID
-                TOKEN=$(curl -X PUT -s -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" http://169.254.169.254/latest/api/token || true)
+
+                # 2) Retrieve instance ID (IMDSv2)
+                TOKEN=$(curl -X PUT -s -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" \
+                  http://169.254.169.254/latest/api/token || true)
                 if [ -n "$TOKEN" ]; then
-                  INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
+                  INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+                    http://169.254.169.254/latest/meta-data/instance-id)
                 else
-                  # fallback to IMDSv1 if it's optional
                   INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
                 fi
-                echo "Retrieved INSTANCE_ID as $INSTANCE_ID"
+                echo "Instance ID: $INSTANCE_ID"
 
-                # 3) Associate the Elastic IP to this instance
+                # 3) Associate EIP
                 aws ec2 associate-address \
                   --allocation-id ${EIPAllocationId} \
                   --instance-id "$INSTANCE_ID" \
-                  --region ${AWS::Region} \
-                  --allow-reassociation
+                  --region ${AWSRegion} \
+                  --allow-reassociation || echo "EIP association failed"
 
-                # 4) Wait for network to be fully available
+                # 4) Attach the existing Docker EBS volume (/dev/sdf)
+                aws ec2 attach-volume \
+                  --volume-id ${DockerVolumeId} \
+                  --instance-id "$INSTANCE_ID" \
+                  --device /dev/sdf \
+                  --region ${AWSRegion} || echo "Volume attach may have failed (already attached?)"
+
+                # Wait for device to show up
                 for i in {1..10}; do
-                  curl -s --head https://wwww.google.com/ && break
-                  echo "Waiting for network to be ready..."
-                  sleep 5
+                  if [ -e /dev/sdf ]; then
+                    echo "Volume /dev/sdf found"
+                    break
+                  fi
+                  echo "Waiting for /dev/sdf..."
+                  sleep 3
                 done
 
-                # 5) Install Docker
+                # If no filesystem, format it
+                if ! blkid /dev/sdf; then
+                  echo "Formatting /dev/sdf as ext4"
+                  mkfs.ext4 /dev/sdf
+                fi
+
+                # 5) Mount EBS at /var/lib/docker
+                mkdir -p /var/lib/docker
+                if ! grep -qs '/var/lib/docker ' /etc/fstab; then
+                  echo "/dev/sdf /var/lib/docker ext4 defaults 0 0" >> /etc/fstab
+                fi
+                mount -a || echo "Warning: mount -a failed"
+
+                # 6) Install Docker
                 install -m 0755 -d /etc/apt/keyrings
                 curl -fsSL https://download.docker.com/linux/ubuntu/gpg | tee /etc/apt/keyrings/docker.asc > /dev/null
                 chmod a+r /etc/apt/keyrings/docker.asc
-                echo "deb [signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+                echo "deb [signed-by=/etc/apt/keyrings/docker.asc] \
+                  https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" \
+                  | tee /etc/apt/sources.list.d/docker.list > /dev/null
                 apt-get update -y
                 apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
                 systemctl enable docker
-
-                # 6) Mount EFS
-                mkdir -p /mnt/nextcloud
-                echo "${EFSId}.efs.${AWS::Region}.amazonaws.com:/ /mnt/nextcloud nfs4 defaults 0 0" >> /etc/fstab
-                mkdir -p /mnt/docker
-                echo "${DockerEFSId}.efs.${AWS::Region}.amazonaws.com:/ /mnt/docker nfs4 defaults 0 0" >> /etc/fstab
-                mount -a || echo "Warning: EFS mount attempt failed. Check logs."
-
-                # 7) Change Docker storage location
-                # Stop Docker
-                systemctl stop docker || true
-          
-                # Move existing Docker storage to the new EFS volume
-                if [ ! -d "/mnt/docker/docker" ]; then
-                    mkdir -p /mnt/docker/docker
-                    mv /var/lib/docker /mnt/docker/docker
-                fi
-          
-                # Update Docker configuration to use the EFS volume
-                mkdir -p /etc/docker
-                echo '{ "data-root": "/mnt/docker/docker" }' > /etc/docker/daemon.json
-          
-                # Restart Docker with the new storage location
                 systemctl start docker
 
-                # 8) Retry pulling the Nextcloud image if it fails
+                # 7) Mount EFS for Nextcloud user data
+                mkdir -p /mnt/nextcloud
+                if ! grep -qs '/mnt/nextcloud ' /etc/fstab; then
+                  echo "${EFSId}.efs.${AWSRegion}.amazonaws.com:/ /mnt/nextcloud nfs4 defaults 0 0" >> /etc/fstab
+                fi
+                mount -a || echo "Warning: EFS mount attempt failed."
+
+                # 8) Pull & run Nextcloud AIO container
                 for i in {1..5}; do
                   docker pull nextcloud/all-in-one:latest && break
-                  echo "Docker pull failed, retrying in 10 seconds..."
-                  sleep 10
+                  echo "Docker pull failed, retrying..."
+                  sleep 5
                 done
 
-                # 9) Run Nextcloud All-in-One container
-                docker run \
-                  --restart always \
-                  -d \
+                docker run --restart always -d \
                   --name nextcloud-aio-mastercontainer \
                   -p 8080:8080 \
                   -e NEXTCLOUD_DATADIR="/mnt/nextcloud" \
-                  -v nextcloud_aio_mastercontainer:/mnt/docker-aio-config \
+                  -v nextcloud_aio_mastercontainer:/var/lib/docker-aio-config \
                   -v /var/run/docker.sock:/var/run/docker.sock:ro \
                   --privileged \
                   nextcloud/all-in-one:latest
+
+                echo "User data complete."
               - {
                   EIPAllocationId: !GetAtt NextcloudEIP.AllocationId,
+                  DockerVolumeId: !Ref NextcloudDockerVolume,
                   EFSId: !Ref NextcloudEFS,
-                  DockerEFSId: !Ref NextcloudDockerEFS
+                  AWSRegion: !Ref AWS::Region
                 }
       VersionDescription: NextcloudAIO
       TagSpecifications:
@@ -332,14 +357,14 @@ Resources:
               Value: NextcloudAIO
 
   ####################################################
-  # 6) Auto Scaling Group (Spot)
+  # 7) Auto Scaling Group (Spot) - Single Subnet
   ####################################################
   NextcloudASG:
     Type: AWS::AutoScaling::AutoScalingGroup
     Properties:
       VPCZoneIdentifier:
-        - !Ref SubnetId1
-        - !Ref SubnetId2
+        - !Ref SubnetId
+
       MixedInstancesPolicy:
         InstancesDistribution:
           OnDemandAllocationStrategy: "lowest-price"
@@ -350,14 +375,16 @@ Resources:
           LaunchTemplateSpecification:
             LaunchTemplateId: !Ref NextcloudLaunchTemplate
             Version: !GetAtt NextcloudLaunchTemplate.LatestVersionNumber
-          Overrides: []
+
       MinSize: 0
       DesiredCapacity: !Ref DesiredCapacity
       MaxSize: !Ref MaxCapacity
+
       Tags:
         - Key: Name
           Value: NextcloudAIO
           PropagateAtLaunch: true
+
     UpdatePolicy:
       AutoScalingRollingUpdate:
         PauseTime: PT0S
@@ -365,14 +392,18 @@ Resources:
         MinInstancesInService: 0
 
 Outputs:
-  EFSFileSystemId:
-    Description: EFS FileSystem ID
-    Value: !Ref NextcloudEFS
+  NextcloudEIPAllocationId:
+    Description: EIP Allocation ID
+    Value: !GetAtt NextcloudEIP.AllocationId
 
   NextcloudASGName:
     Description: Auto Scaling Group Name
     Value: !Ref NextcloudASG
 
-  NextcloudEIPAllocationId:
-    Description: Allocation ID of the EIP
-    Value: !GetAtt NextcloudEIP.AllocationId
+  NextcloudVolumeId:
+    Description: EBS Volume ID for Docker data
+    Value: !Ref NextcloudDockerVolume
+
+  NextcloudEFSId:
+    Description: EFS FileSystem ID
+    Value: !Ref NextcloudEFS
