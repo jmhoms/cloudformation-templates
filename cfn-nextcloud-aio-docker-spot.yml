@@ -5,8 +5,9 @@ Description: >
     - EBS volume for Docker data
     - Automatic EIP
     - IAM policy with Condition Keys
-    - All resources tagged "NextcloudAIO=true" for cost monitoring
+    - All possible resources tagged "NextcloudAIO=true" for cost monitoring
     - "lowest-price" Spot strategy
+    - No top-level Tags in the LaunchTemplate (unsupported in your environment)
 
 Parameters:
   VpcId:
@@ -256,10 +257,12 @@ Resources:
       # IAM InstanceProfile doesn't support custom tags
 
   ####################################################
-  # 6) Launch Template (Tags at top-level + instance TagSpecifications)
+  # 6) Launch Template 
+  #    No top-level "Tags" property (unsupported).
   ####################################################
   NextcloudLaunchTemplate:
     Type: AWS::EC2::LaunchTemplate
+    Properties:
       LaunchTemplateData:
         IamInstanceProfile:
           Arn: !GetAtt NextcloudInstanceProfile.Arn
@@ -282,8 +285,7 @@ Resources:
               DeleteOnTermination: true
               Encrypted: true
 
-        # Only valid resource type here is "instance". 
-        # We'll tag the instances at launch:
+        # We can only specify 'instance' or 'volume' resource types here
         TagSpecifications:
           - ResourceType: instance
             Tags:
@@ -316,7 +318,7 @@ Resources:
                 fi
                 echo "Instance ID: $INSTANCE_ID"
 
-                # 3) Associate EIP (conditionally allowed if instance is tagged NextcloudAIO=true)
+                # 3) Associate EIP
                 aws ec2 associate-address \
                   --allocation-id ${EIPAllocationId} \
                   --instance-id "$INSTANCE_ID" \
@@ -330,7 +332,6 @@ Resources:
                   --device /dev/sdf \
                   --region ${AWSRegion} || echo "Volume attach may have failed"
 
-                # Wait up to 30s for device
                 for i in {1..10}; do
                   if [ -e /dev/sdf ]; then
                     echo "Volume /dev/sdf found"
@@ -339,7 +340,6 @@ Resources:
                   sleep 3
                 done
 
-                # If brand new volume, format it ext4
                 if ! blkid /dev/sdf; then
                   echo "Formatting /dev/sdf as ext4..."
                   mkfs.ext4 /dev/sdf
