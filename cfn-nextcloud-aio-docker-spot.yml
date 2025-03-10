@@ -321,7 +321,7 @@ Resources:
                   nextcloud/all-in-one:latest
               - {
                   EIPAllocationId: !GetAtt NextcloudEIP.AllocationId,
-                  EFSId: !Ref NextcloudEFS
+                  EFSId: !Ref NextcloudEFS,
                   DockerEFSId: !Ref NextcloudDockerEFS
                 }
       VersionDescription: NextcloudAIO
