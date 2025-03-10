@@ -47,7 +47,6 @@ Parameters:
     Description: Size (GB) of the EBS volume for Docker data
 
 Mappings:
-  # Update with valid Ubuntu AMIs for your region(s)
   RegionMap:
     eu-west-1:
       AMI: "ami-03fd334507439f4d1"
@@ -333,7 +332,14 @@ Resources:
                 }
                 
                 ###################################
-                # 1) Get Instance ID
+                # 1) Install AWS CLI & basic tools
+                ###################################
+                apt-get update -y
+                snap install aws-cli --classic
+                apt-get install -y ca-certificates curl gnupg nfs-common
+                
+                ###################################
+                # 2) Get Instance ID
                 ###################################
                 TOKEN=$(curl -X PUT -s -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" \
                   http://169.254.169.254/latest/api/token || true)
@@ -343,7 +349,7 @@ Resources:
                 echo "Instance ID: $INSTANCE_ID"
                 
                 ###############################################################################
-                # 2) Volume attachment logic
+                # 3) Volume attachment logic
                 ###############################################################################
                 if ! wait_for_free_or_timeout; then
                   echo "Forcing detach..."
@@ -361,9 +367,9 @@ Resources:
                   --region "$REGION" || echo "Attach failed, continuing..."
                 
                 ###############################################################################
-                # 3) Wait for NVMe symlink
+                # 4) Wait for NVMe symlink
                 ###############################################################################
-                SYMLINK="/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_${VOLUME_ID}"
+                SYMLINK="/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_$${VOLUME_ID}"
                 FOUND_DEVICE=""
                 for i in {1..10}; do
                   if [ -e "$SYMLINK" ]; then
@@ -384,7 +390,7 @@ Resources:
                 fi
                 
                 ###############################################################################
-                # 4) Associate EIP
+                # 5) Associate EIP
                 ###############################################################################
                 aws ec2 associate-address \
                   --allocation-id "${EIPAllocationId}" \
@@ -393,7 +399,7 @@ Resources:
                   --allow-reassociation || echo "EIP association failed"
                 
                 ###############################################################################
-                # 5) Install Docker & Mount EFS
+                # 6) Install Docker & Mount EFS
                 ###############################################################################
                 apt-get update -y
                 apt-get install -y docker.io
@@ -405,7 +411,7 @@ Resources:
                 mount -a || true
                 
                 ###############################################################################
-                # 6) Start Nextcloud AIO
+                # 7) Start Nextcloud AIO
                 ###############################################################################
                 docker run -d \
                   --name nextcloud-aio-mastercontainer \
