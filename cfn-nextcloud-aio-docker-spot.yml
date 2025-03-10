@@ -231,7 +231,12 @@ Resources:
                 set -euxo pipefail
                 exec > /var/log/user-data.log 2>&1
 
-                # 1) Retrieve IMDSv2 token for instance ID
+                # 1) Install AWS CLI and basic tools
+                apt-get update -y
+                snap install aws-cli --classic
+                apt-get install -y ca-certificates curl gnupg nfs-common
+                
+                # 2) Retrieve IMDSv2 token for instance ID
                 TOKEN=$(curl -X PUT -s -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" http://169.254.169.254/latest/api/token || true)
                 if [ -n "$TOKEN" ]; then
                   INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
@@ -241,25 +246,21 @@ Resources:
                 fi
                 echo "Retrieved INSTANCE_ID as $INSTANCE_ID"
 
-                # 2) Associate the Elastic IP to this instance
+                # 3) Associate the Elastic IP to this instance
                 aws ec2 associate-address \
                   --allocation-id ${EIPAllocationId} \
                   --instance-id "$INSTANCE_ID" \
                   --region ${AWS::Region} \
                   --allow-reassociation
 
-                # 3) Wait for network to be fully available
+                # 4) Wait for network to be fully available
                 for i in {1..10}; do
                   curl -s --head https://wwww.google.com/ && break
                   echo "Waiting for network to be ready..."
                   sleep 5
                 done
 
-                # 4) Install Docker & AWS CLI
-                apt-get update -y
-                snap install aws-cli --classic
-
-                apt-get install -y ca-certificates curl gnupg nfs-common
+                # 5) Install Docker
                 install -m 0755 -d /etc/apt/keyrings
                 curl -fsSL https://download.docker.com/linux/ubuntu/gpg | tee /etc/apt/keyrings/docker.asc > /dev/null
                 chmod a+r /etc/apt/keyrings/docker.asc
@@ -268,14 +269,14 @@ Resources:
                 apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
                 systemctl enable docker
 
-                # 5) Mount EFS
+                # 6) Mount EFS
                 mkdir -p /mnt/nextcloud
                 echo "${EFSId}.efs.${AWS::Region}.amazonaws.com:/ /mnt/nextcloud nfs4 defaults 0 0" >> /etc/fstab
                 mkdir -p /mnt/docker
                 echo "${NextcloudDockerEFS}.efs.${AWS::Region}.amazonaws.com:/ /mnt/docker nfs4 defaults 0 0" >> /etc/fstab
                 mount -a || echo "Warning: EFS mount attempt failed. Check logs."
 
-                # 6) Change Docker storage location
+                # 7) Change Docker storage location
                 # Stop Docker
                 systemctl stop docker || true
           
@@ -292,14 +293,14 @@ Resources:
                 # Restart Docker with the new storage location
                 systemctl start docker
 
-                # 7) Retry pulling the Nextcloud image if it fails
+                # 8) Retry pulling the Nextcloud image if it fails
                 for i in {1..5}; do
                   docker pull nextcloud/all-in-one:latest && break
                   echo "Docker pull failed, retrying in 10 seconds..."
                   sleep 10
                 done
 
-                # 8) Run Nextcloud All-in-One container
+                # 9) Run Nextcloud All-in-One container
                 docker run \
                   --restart always \
                   -d \
