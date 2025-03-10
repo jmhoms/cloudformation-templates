@@ -308,16 +308,16 @@ Resources:
                 CHECK_INTERVAL=10     # seconds between checks
                 CHECK_LIMIT=12        # number of checks (12 * 10s = 2 minutes total)
                 
+                # CloudFormation substitutions for DockerVolumeId & Region:
                 VOLUME_ID="${DockerVolumeId}"
                 REGION="${AWSRegion}"
                 
                 function volume_in_use() {
                   # Returns 0 if volume is in use (attached), 1 if volume is free (not in use).
-                  # "in use" means there's at least one attachment with State != "detached".
                   local usage
                   usage=$(aws ec2 describe-volumes \
-                    --volume-ids "$VOLUME_ID" \
-                    --region "$REGION" \
+                    --volume-ids "$${VOLUME_ID}" \
+                    --region "$${REGION}" \
                     --query "Volumes[0].Attachments[?State!='detached']" \
                     --output json)
                 
@@ -331,10 +331,10 @@ Resources:
                 function wait_for_free_or_timeout() {
                   # Poll volume_in_use in a loop, returning 0 if we find it free, 1 if still in use after time limit
                   local attempt=1
-                  while [ $attempt -le $CHECK_LIMIT ]; do
+                  while [ $attempt -le $${CHECK_LIMIT} ]; do
                     if volume_in_use; then
-                      echo "Volume is still in use (attempt ${attempt}/${CHECK_LIMIT})"
-                      sleep $CHECK_INTERVAL
+                      echo "Volume is still in use (attempt $${attempt}/$${CHECK_LIMIT})"
+                      sleep $${CHECK_INTERVAL}
                       ((attempt++))
                     else
                       echo "Volume is not in use!"
@@ -344,7 +344,7 @@ Resources:
                   # If we exit the loop, volume_in_use is still true
                   return 1
                 }
-
+                
                 ###################################
                 # 1) Install AWS CLI & basic tools
                 ###################################
@@ -364,20 +364,20 @@ Resources:
                   INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
                 fi
                 echo "Instance ID is $INSTANCE_ID"
-  
+        
                 ###############################################################################
                 # 3) Wait up to 2 minutes for volume to be free or force detach and wait 2 more
                 ###############################################################################
                 if ! wait_for_free_or_timeout; then
-                  echo "Volume $VOLUME_ID is still in use after 2 minutes. Forcing detach now..."
+                  echo "Volume $${VOLUME_ID} is still in use after 2 minutes. Forcing detach now..."
                   aws ec2 detach-volume \
-                    --volume-id "$VOLUME_ID" \
+                    --volume-id "$${VOLUME_ID}" \
                     --force \
-                    --region "$REGION"
+                    --region "$${REGION}"
                 
                   # 3a) Wait up to another 2 minutes for volume to become free
                   if ! wait_for_free_or_timeout; then
-                    echo "Volume $VOLUME_ID is STILL in use after force detach + 2 more minutes. Exiting!"
+                    echo "Volume $${VOLUME_ID} is STILL in use after force detach + 2 more minutes. Exiting!"
                     exit 1
                   fi
                 fi
@@ -385,7 +385,7 @@ Resources:
                 ###############################################################################
                 # 4) Now volume should be free, attach to this instance
                 ###############################################################################
-                # Retrieve instance ID (IMDSv2 fallback to v1)
+                # Retrieve instance ID (IMDSv2 fallback to v1) again, just in case
                 TOKEN=$(curl -X PUT -s -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" \
                   http://169.254.169.254/latest/api/token || true)
                 if [ -n "$TOKEN" ]; then
@@ -396,18 +396,18 @@ Resources:
                 fi
                 echo "Instance ID: $INSTANCE_ID"
                 
-                echo "Attaching volume $VOLUME_ID to instance $INSTANCE_ID at /dev/sdf"
+                echo "Attaching volume $${VOLUME_ID} to instance $INSTANCE_ID at /dev/sdf"
                 aws ec2 attach-volume \
-                  --volume-id "$VOLUME_ID" \
+                  --volume-id "$${VOLUME_ID}" \
                   --instance-id "$INSTANCE_ID" \
                   --device /dev/sdf \
-                  --region "$REGION" \
+                  --region "$${REGION}" \
                   || echo "AttachVolume failed (already attached?), continuing..."
                 
                 ###############################################################################
-                # 5) Wait for the NVMe symlink (up to 30s in 3s increments), Format and Mount
+                # 5) Wait for the NVMe symlink (up to 30s in 3s increments), format and mount
                 ###############################################################################
-                SYMLINK="/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_${VOLUME_ID}"
+                SYMLINK="/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_$${VOLUME_ID}"
                 FOUND_DEVICE=""
                 for i in {1..10}; do
                   if [ -e "$SYMLINK" ]; then
@@ -440,7 +440,7 @@ Resources:
                 aws ec2 associate-address \
                   --allocation-id "${EIPAllocationId}" \
                   --instance-id "$INSTANCE_ID" \
-                  --region "$REGION" \
+                  --region "$${REGION}" \
                   --allow-reassociation || echo "EIP association failed"
                 
                 ###############################################################################
