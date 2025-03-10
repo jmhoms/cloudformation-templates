@@ -302,6 +302,49 @@ Resources:
                 set -euxo pipefail
                 exec > /var/log/user-data.log 2>&1
                 
+                ###############################################################################
+                # 0) Basic constants & helper function
+                ###############################################################################
+                CHECK_INTERVAL=10     # seconds between checks
+                CHECK_LIMIT=12        # number of checks (12 * 10s = 2 minutes total)
+                
+                VOLUME_ID="${DockerVolumeId}"
+                REGION="${AWSRegion}"
+                
+                function volume_in_use() {
+                  # Returns 0 if volume is in use (attached), 1 if volume is free (not in use).
+                  # "in use" means there's at least one attachment with State != "detached".
+                  local usage
+                  usage=$(aws ec2 describe-volumes \
+                    --volume-ids "$VOLUME_ID" \
+                    --region "$REGION" \
+                    --query "Volumes[0].Attachments[?State!='detached']" \
+                    --output json)
+                
+                  if [ "$usage" != "[]" ]; then
+                    return 0  # in use
+                  else
+                    return 1  # not in use
+                  fi
+                }
+                
+                function wait_for_free_or_timeout() {
+                  # Poll volume_in_use in a loop, returning 0 if we find it free, 1 if still in use after time limit
+                  local attempt=1
+                  while [ $attempt -le $CHECK_LIMIT ]; do
+                    if volume_in_use; then
+                      echo "Volume is still in use (attempt ${attempt}/${CHECK_LIMIT})"
+                      sleep $CHECK_INTERVAL
+                      ((attempt++))
+                    else
+                      echo "Volume is not in use!"
+                      return 0
+                    fi
+                  done
+                  # If we exit the loop, volume_in_use is still true
+                  return 1
+                }
+
                 ###################################
                 # 1) Install AWS CLI & basic tools
                 ###################################
@@ -321,64 +364,90 @@ Resources:
                   INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
                 fi
                 echo "Instance ID is $INSTANCE_ID"
+  
+                ###############################################################################
+                # 3) Wait up to 2 minutes for volume to be free or force detach and wait 2 more
+                ###############################################################################
+                if ! wait_for_free_or_timeout; then
+                  echo "Volume $VOLUME_ID is still in use after 2 minutes. Forcing detach now..."
+                  aws ec2 detach-volume \
+                    --volume-id "$VOLUME_ID" \
+                    --force \
+                    --region "$REGION"
                 
-                ###################################
-                # 3) Associate EIP (if authorized)
-                ###################################
-                aws ec2 associate-address \
-                  --allocation-id ${EIPAllocationId} \
-                  --instance-id "$INSTANCE_ID" \
-                  --region ${AWSRegion} \
-                  --allow-reassociation \
-                  || echo "EIP association failed or no permission"
+                  # 3a) Wait up to another 2 minutes for volume to become free
+                  if ! wait_for_free_or_timeout; then
+                    echo "Volume $VOLUME_ID is STILL in use after force detach + 2 more minutes. Exiting!"
+                    exit 1
+                  fi
+                fi
                 
-                ###################################
-                # 4) Attach EBS volume (logically /dev/sdf)
-                ###################################
+                ###############################################################################
+                # 4) Now volume should be free, attach to this instance
+                ###############################################################################
+                # Retrieve instance ID (IMDSv2 fallback to v1)
+                TOKEN=$(curl -X PUT -s -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" \
+                  http://169.254.169.254/latest/api/token || true)
+                if [ -n "$TOKEN" ]; then
+                  INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+                    http://169.254.169.254/latest/meta-data/instance-id)
+                else
+                  INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
+                fi
+                echo "Instance ID: $INSTANCE_ID"
+                
+                echo "Attaching volume $VOLUME_ID to instance $INSTANCE_ID at /dev/sdf"
                 aws ec2 attach-volume \
-                  --volume-id ${DockerVolumeId} \
+                  --volume-id "$VOLUME_ID" \
                   --instance-id "$INSTANCE_ID" \
                   --device /dev/sdf \
-                  --region ${AWSRegion} \
-                  || echo "Volume attach may have failed (already attached?)"
+                  --region "$REGION" \
+                  || echo "AttachVolume failed (already attached?), continuing..."
                 
-                ###################################
-                # 5) Wait for NVMe device symlink
-                ###################################
-                VOLUME_SYMLINK="/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_${DockerVolumeId}"
+                ###############################################################################
+                # 5) Wait for the NVMe symlink (up to 30s in 3s increments), Format and Mount
+                ###############################################################################
+                SYMLINK="/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_${VOLUME_ID}"
                 FOUND_DEVICE=""
                 for i in {1..10}; do
-                  if [ -e "$VOLUME_SYMLINK" ]; then
-                    # Resolve the real device path, e.g. /dev/nvme1n1
-                    FOUND_DEVICE=$(readlink -f "$VOLUME_SYMLINK")
-                    echo "Found EBS volume symlink at $VOLUME_SYMLINK -> $FOUND_DEVICE"
+                  if [ -e "$SYMLINK" ]; then
+                    FOUND_DEVICE=$(readlink -f "$SYMLINK")
+                    echo "Found volume symlink: $SYMLINK -> $FOUND_DEVICE"
                     break
                   fi
-                  echo "Waiting for $VOLUME_SYMLINK (attempt $i/10)..."
+                  echo "Waiting for $SYMLINK (attempt $i/10)..."
                   sleep 3
                 done
                 
                 if [ -z "$FOUND_DEVICE" ]; then
-                  echo "EBS volume did not appear after 30s. Skipping volume setup."
+                  echo "Volume did not appear after 30s, skipping Docker volume setup."
                 else
-                  ###################################
-                  # 6) Format & mount the EBS volume
-                  ###################################
+                  # If brand new, format it
                   if ! blkid "$FOUND_DEVICE"; then
                     echo "Formatting $FOUND_DEVICE as ext4..."
                     mkfs.ext4 "$FOUND_DEVICE"
                   fi
-                
                   mkdir -p /var/lib/docker
                   if ! grep -qs '/var/lib/docker ' /etc/fstab; then
                     echo "$FOUND_DEVICE /var/lib/docker ext4 defaults 0 0" >> /etc/fstab
                   fi
-                  mount -a || echo "Warning: mount -a failed. Check logs."
+                  mount -a || echo "Warning: mount -a failed!"
                 fi
                 
-                ###################################
+                ###############################################################################
+                # 6) Associate EIP 
+                ###############################################################################
+                aws ec2 associate-address \
+                  --allocation-id "${EIPAllocationId}" \
+                  --instance-id "$INSTANCE_ID" \
+                  --region "$REGION" \
+                  --allow-reassociation || echo "EIP association failed"
+                
+                ###############################################################################
                 # 7) Install Docker
-                ###################################
+                ###############################################################################
+                apt-get update -y
+                apt-get install -y ca-certificates curl gnupg
                 install -m 0755 -d /etc/apt/keyrings
                 curl -fsSL https://download.docker.com/linux/ubuntu/gpg | tee /etc/apt/keyrings/docker.asc > /dev/null
                 chmod a+r /etc/apt/keyrings/docker.asc
@@ -390,21 +459,21 @@ Resources:
                 systemctl enable docker
                 systemctl start docker
                 
-                ###################################
+                ###############################################################################
                 # 8) Mount EFS for Nextcloud data
-                ###################################
+                ###############################################################################
                 mkdir -p /mnt/nextcloud
                 if ! grep -qs '/mnt/nextcloud ' /etc/fstab; then
                   echo "${EFSId}.efs.${AWSRegion}.amazonaws.com:/ /mnt/nextcloud nfs4 defaults 0 0" >> /etc/fstab
                 fi
                 mount -a || echo "Warning: EFS mount attempt failed."
                 
-                ###################################
-                # 9) Pull & Run Nextcloud AIO
-                ###################################
+                ###############################################################################
+                # 9) Pull & run Nextcloud AIO
+                ###############################################################################
                 for i in {1..5}; do
                   docker pull nextcloud/all-in-one:latest && break
-                  echo "Docker pull failed, retrying in 5 seconds..."
+                  echo "Docker pull failed, retrying..."
                   sleep 5
                 done
                 
@@ -417,7 +486,7 @@ Resources:
                   --privileged \
                   nextcloud/all-in-one:latest
                 
-                echo "User data script complete."                
+                echo "User data script complete."
               - {
                   EIPAllocationId: !GetAtt NextcloudEIP.AllocationId,
                   DockerVolumeId: !Ref NextcloudDockerVolume,
