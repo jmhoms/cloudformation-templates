@@ -302,16 +302,16 @@ Resources:
                 set -euxo pipefail
                 exec > /var/log/user-data.log 2>&1
                 
-                ###########################
-                # 1) Install AWS CLI & tools
-                ###########################
+                ###################################
+                # 1) Install AWS CLI & basic tools
+                ###################################
                 apt-get update -y
                 snap install aws-cli --classic
                 apt-get install -y ca-certificates curl gnupg nfs-common
                 
-                ###########################
-                # 2) Retrieve Instance ID via IMDSv2 (fallback to IMDSv1)
-                ###########################
+                ###################################
+                # 2) Get the instance ID via IMDSv2
+                ###################################
                 TOKEN=$(curl -X PUT -s -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" \
                   http://169.254.169.254/latest/api/token || true)
                 if [ -n "$TOKEN" ]; then
@@ -322,52 +322,53 @@ Resources:
                 fi
                 echo "Instance ID is $INSTANCE_ID"
                 
-                ###########################
-                # 3) Associate the Elastic IP
-                ###########################
+                ###################################
+                # 3) Associate EIP (if authorized)
+                ###################################
                 aws ec2 associate-address \
                   --allocation-id ${EIPAllocationId} \
                   --instance-id "$INSTANCE_ID" \
                   --region ${AWSRegion} \
-                  --allow-reassociation || echo "EIP association failed or not authorized"
+                  --allow-reassociation \
+                  || echo "EIP association failed or no permission"
                 
-                ###########################
-                # 4) Attach the EBS volume at /dev/sdf
-                ###########################
+                ###################################
+                # 4) Attach EBS volume (logically /dev/sdf)
+                ###################################
                 aws ec2 attach-volume \
                   --volume-id ${DockerVolumeId} \
                   --instance-id "$INSTANCE_ID" \
                   --device /dev/sdf \
                   --region ${AWSRegion} \
-                  || echo "EBS volume attach may have failed (already attached?)"
+                  || echo "Volume attach may have failed (already attached?)"
                 
-                ###########################
-                # 5) Wait for device (/dev/sdf or /dev/xvdf)
-                ###########################
+                ###################################
+                # 5) Wait for NVMe device symlink
+                ###################################
+                VOLUME_SYMLINK="/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_${DockerVolumeId}"
                 FOUND_DEVICE=""
                 for i in {1..10}; do
-                  if [ -b /dev/sdf ]; then
-                    FOUND_DEVICE="/dev/sdf"
-                    break
-                  elif [ -b /dev/xvdf ]; then
-                    FOUND_DEVICE="/dev/xvdf"
+                  if [ -e "$VOLUME_SYMLINK" ]; then
+                    # Resolve the real device path, e.g. /dev/nvme1n1
+                    FOUND_DEVICE=$(readlink -f "$VOLUME_SYMLINK")
+                    echo "Found EBS volume symlink at $VOLUME_SYMLINK -> $FOUND_DEVICE"
                     break
                   fi
-                  echo "Waiting for /dev/sdf or /dev/xvdf... Attempt $i/10"
+                  echo "Waiting for $VOLUME_SYMLINK (attempt $i/10)..."
                   sleep 3
                 done
                 
                 if [ -z "$FOUND_DEVICE" ]; then
                   echo "EBS volume did not appear after 30s. Skipping volume setup."
                 else
-                  echo "Found EBS volume at $FOUND_DEVICE"
-                  # Check if it's already formatted
+                  ###################################
+                  # 6) Format & mount the EBS volume
+                  ###################################
                   if ! blkid "$FOUND_DEVICE"; then
                     echo "Formatting $FOUND_DEVICE as ext4..."
                     mkfs.ext4 "$FOUND_DEVICE"
                   fi
                 
-                  # Mount it to /var/lib/docker
                   mkdir -p /var/lib/docker
                   if ! grep -qs '/var/lib/docker ' /etc/fstab; then
                     echo "$FOUND_DEVICE /var/lib/docker ext4 defaults 0 0" >> /etc/fstab
@@ -375,9 +376,9 @@ Resources:
                   mount -a || echo "Warning: mount -a failed. Check logs."
                 fi
                 
-                ###########################
-                # 6) Install Docker
-                ###########################
+                ###################################
+                # 7) Install Docker
+                ###################################
                 install -m 0755 -d /etc/apt/keyrings
                 curl -fsSL https://download.docker.com/linux/ubuntu/gpg | tee /etc/apt/keyrings/docker.asc > /dev/null
                 chmod a+r /etc/apt/keyrings/docker.asc
@@ -389,18 +390,18 @@ Resources:
                 systemctl enable docker
                 systemctl start docker
                 
-                ###########################
-                # 7) Mount EFS
-                ###########################
+                ###################################
+                # 8) Mount EFS for Nextcloud data
+                ###################################
                 mkdir -p /mnt/nextcloud
                 if ! grep -qs '/mnt/nextcloud ' /etc/fstab; then
                   echo "${EFSId}.efs.${AWSRegion}.amazonaws.com:/ /mnt/nextcloud nfs4 defaults 0 0" >> /etc/fstab
                 fi
-                mount -a || echo "Warning: EFS mount attempt failed. Check logs."
+                mount -a || echo "Warning: EFS mount attempt failed."
                 
-                ###########################
-                # 8) Pull & Run Nextcloud AIO
-                ###########################
+                ###################################
+                # 9) Pull & Run Nextcloud AIO
+                ###################################
                 for i in {1..5}; do
                   docker pull nextcloud/all-in-one:latest && break
                   echo "Docker pull failed, retrying in 5 seconds..."
