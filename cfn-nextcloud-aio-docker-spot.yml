@@ -130,7 +130,7 @@ Resources:
     Type: AWS::EFS::MountTarget
     Properties:
       FileSystemId: !Ref NextcloudDockerEFS
-      SubnetId: !Ref SubnetId
+      SubnetId: !Ref SubnetId1
       SecurityGroups:
         - !Ref NextcloudEFSSecurityGroup
 
