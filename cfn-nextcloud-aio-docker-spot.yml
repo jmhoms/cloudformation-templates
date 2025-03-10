@@ -121,6 +121,9 @@ Resources:
     Type: AWS::EFS::FileSystem
     Properties:
       Encrypted: true
+      FileSystemTags:
+        - Key: Name
+          Value: NextcloudDockerEFS      
       PerformanceMode: generalPurpose
       ThroughputMode: bursting
       LifecyclePolicies:
@@ -133,6 +136,7 @@ Resources:
       SubnetId: !Ref SubnetId1
       SecurityGroups:
         - !Ref NextcloudEFSSecurityGroup
+
 
   ####################################################
   # 3) Elastic IP (EIP)
