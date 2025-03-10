@@ -129,11 +129,19 @@ Resources:
       LifecyclePolicies:
         - TransitionToIA: AFTER_30_DAYS
 
-  NextcloudDockerEFSMountTarget:
+  NextcloudDockerEFSMountTarget1:
     Type: AWS::EFS::MountTarget
     Properties:
       FileSystemId: !Ref NextcloudDockerEFS
       SubnetId: !Ref SubnetId1
+      SecurityGroups:
+        - !Ref NextcloudEFSSecurityGroup
+
+  NextcloudDockerEFSMountTarget2:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref NextcloudDockerEFS
+      SubnetId: !Ref SubnetId2
       SecurityGroups:
         - !Ref NextcloudEFSSecurityGroup
 
@@ -273,7 +281,7 @@ Resources:
                 mkdir -p /mnt/nextcloud
                 echo "${EFSId}.efs.${AWS::Region}.amazonaws.com:/ /mnt/nextcloud nfs4 defaults 0 0" >> /etc/fstab
                 mkdir -p /mnt/docker
-                echo "${NextcloudDockerEFS}.efs.${AWS::Region}.amazonaws.com:/ /mnt/docker nfs4 defaults 0 0" >> /etc/fstab
+                echo "${DockerEFSId}.efs.${AWS::Region}.amazonaws.com:/ /mnt/docker nfs4 defaults 0 0" >> /etc/fstab
                 mount -a || echo "Warning: EFS mount attempt failed. Check logs."
 
                 # 7) Change Docker storage location
@@ -314,6 +322,7 @@ Resources:
               - {
                   EIPAllocationId: !GetAtt NextcloudEIP.AllocationId,
                   EFSId: !Ref NextcloudEFS
+                  DockerEFSId: !Ref NextcloudDockerEFS
                 }
       VersionDescription: NextcloudAIO
       TagSpecifications:
