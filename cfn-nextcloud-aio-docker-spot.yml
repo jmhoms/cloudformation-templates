@@ -1,5 +1,13 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: Nextcloud All-in-One on Spot instance with EFS, EBS, EIP, and IAM policies.
+Description: >
+  Nextcloud All-in-One on Spot in a single AZ with:
+    - EFS for user data
+    - EBS volume for Docker data
+    - Automatic EIP
+    - IAM policy with Condition Keys
+    - All possible resources tagged "NextcloudAIO=true" for cost monitoring
+    - "lowest-price" Spot strategy
+    - No top-level Tags in the LaunchTemplate (unsupported in your environment)
 
 Parameters:
   VpcId:
@@ -12,7 +20,7 @@ Parameters:
 
   SubnetAZ:
     Type: String
-    Description: Availability Zone of the Subnet (e.g., "eu-west-1a")
+    Description: Availability Zone of the above Subnet (e.g. "eu-west-1a")
 
   KeyName:
     Type: AWS::EC2::KeyPair::KeyName
@@ -39,6 +47,7 @@ Parameters:
     Description: Size (GB) of the EBS volume for Docker data
 
 Mappings:
+  # Update with valid Ubuntu AMIs for your region(s)
   RegionMap:
     eu-west-1:
       AMI: "ami-03fd334507439f4d1"
@@ -46,6 +55,9 @@ Mappings:
       AMI: "ami-04b4f1a9cf54c11d0"
 
 Resources:
+  ####################################################
+  # 1) Security Groups
+  ####################################################
   NextcloudInstanceSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
@@ -92,6 +104,9 @@ Resources:
         - Key: NextcloudAIO
           Value: "true"
 
+  ####################################################
+  # 2) EFS (Nextcloud user data)
+  ####################################################
   NextcloudEFS:
     Type: AWS::EFS::FileSystem
     Properties:
@@ -110,6 +125,9 @@ Resources:
       SecurityGroups:
         - !Ref NextcloudEFSSecurityGroup
 
+  ####################################################
+  # 3) Elastic IP (EIP)
+  ####################################################
   NextcloudEIP:
     Type: AWS::EC2::EIP
     Properties:
@@ -120,6 +138,9 @@ Resources:
         - Key: NextcloudAIO
           Value: "true"
 
+  ####################################################
+  # 4) EBS Volume for Docker (/var/lib/docker)
+  ####################################################
   NextcloudDockerVolume:
     Type: AWS::EC2::Volume
     Properties:
@@ -133,6 +154,9 @@ Resources:
         - Key: NextcloudAIO
           Value: "true"
 
+  ####################################################
+  # 5) IAM Role & Policy with Condition Keys
+  ####################################################
   NextcloudRole:
     Type: AWS::IAM::Role
     Properties:
@@ -230,6 +254,10 @@ Resources:
       Roles:
         - !Ref NextcloudRole
 
+  ####################################################
+  # 6) Launch Template 
+  #    No top-level "Tags" property (unsupported).
+  ####################################################
   NextcloudLaunchTemplate:
     Type: AWS::EC2::LaunchTemplate
     Properties:
@@ -241,10 +269,12 @@ Resources:
         KeyName: !Ref KeyName
         SecurityGroupIds:
           - !Ref NextcloudInstanceSecurityGroup
+
         MetadataOptions:
           HttpTokens: required
           HttpEndpoint: enabled
           HttpPutResponseHopLimit: 2
+
         BlockDeviceMappings:
           - DeviceName: "/dev/sda1"
             Ebs:
@@ -252,6 +282,7 @@ Resources:
               VolumeType: gp3
               DeleteOnTermination: true
               Encrypted: true
+
         TagSpecifications:
           - ResourceType: instance
             Tags:
@@ -259,6 +290,7 @@ Resources:
                 Value: NextcloudAIO-Instance
               - Key: NextcloudAIO
                 Value: "true"
+
         UserData:
           Fn::Base64:
             Fn::Sub:
@@ -267,102 +299,191 @@ Resources:
                 set -euxo pipefail
                 exec > /var/log/user-data.log 2>&1
                 
-                CHECK_INTERVAL=10
-                CHECK_LIMIT=12
+                ###############################################################################
+                # 0) Basic constants & helper function
+                ###############################################################################
+                CHECK_INTERVAL=10     # seconds between checks
+                CHECK_LIMIT=12        # number of checks (12 * 10s = 2 minutes total)
+                
+                # CloudFormation substitutions for DockerVolumeId & Region:
                 VOLUME_ID="${DockerVolumeId}"
                 REGION="${AWSRegion}"
                 
                 function volume_in_use() {
+                  # Returns 0 if volume is in use (attached), 1 if volume is free (not in use).
                   local usage
                   usage=$(aws ec2 describe-volumes \
-                    --volume-ids "$${VOLUME_ID}" \
-                    --region "$${REGION}" \
+                    --volume-ids "$$VOLUME_ID" \
+                    --region "$$REGION" \
                     --query "Volumes[0].Attachments[?State!='detached']" \
                     --output json)
-                  [ "$usage" != "[]" ]
+                
+                  if [ "$$usage" != "[]" ]; then
+                    return 0  # in use
+                  else
+                    return 1  # not in use
+                  fi
                 }
                 
                 function wait_for_free_or_timeout() {
+                  # Poll volume_in_use in a loop, returning 0 if we find it free, 1 if still in use after time limit
                   local attempt=1
-                  while [ $attempt -le $CHECK_LIMIT ]; do
+                  while [ $$attempt -le $$CHECK_LIMIT ]; do
                     if volume_in_use; then
-                      echo "Volume is still in use (attempt $attempt/$CHECK_LIMIT)"
-                      sleep $CHECK_INTERVAL
+                      echo "Volume is still in use (attempt $$attempt/$$CHECK_LIMIT)"
+                      sleep $$CHECK_INTERVAL
                       ((attempt++))
                     else
                       echo "Volume is not in use!"
                       return 0
                     fi
                   done
+                  # If we exit the loop, volume_in_use is still true
                   return 1
                 }
                 
+                ###################################
+                # 1) Install AWS CLI & basic tools
+                ###################################
                 apt-get update -y
                 snap install aws-cli --classic
                 apt-get install -y ca-certificates curl gnupg nfs-common
                 
+                ###################################
+                # 2) Get the instance ID via IMDSv2
+                ###################################
                 TOKEN=$(curl -X PUT -s -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" \
                   http://169.254.169.254/latest/api/token || true)
-                INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
-                  http://169.254.169.254/latest/meta-data/instance-id || curl -s http://169.254.169.254/latest/meta-data/instance-id)
-                echo "Instance ID: $INSTANCE_ID"
-                
+                if [ -n "$$TOKEN" ]; then
+                  INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $$TOKEN" \
+                    http://169.254.169.254/latest/meta-data/instance-id)
+                else
+                  INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
+                fi
+                echo "Instance ID is $$INSTANCE_ID"
+        
+                ###############################################################################
+                # 3) Wait up to 2 minutes for volume to be free or force detach and wait 2 more
+                ###############################################################################
                 if ! wait_for_free_or_timeout; then
-                  echo "Volume $VOLUME_ID is still in use after 2 minutes. Forcing detach..."
-                  aws ec2 detach-volume --volume-id "$VOLUME_ID" --region "$REGION" --force
+                  echo "Volume $$VOLUME_ID is still in use after 2 minutes. Forcing detach now..."
+                  aws ec2 detach-volume \
+                    --volume-id "$$VOLUME_ID" \
+                    --force \
+                    --region "$$REGION"
+                
+                  # 3a) Wait up to another 2 minutes for volume to become free
                   if ! wait_for_free_or_timeout; then
-                    echo "Volume $VOLUME_ID still in use after force detach. Exiting!"
+                    echo "Volume $$VOLUME_ID is STILL in use after force detach + 2 more minutes. Exiting!"
                     exit 1
                   fi
                 fi
                 
-                echo "Attaching volume $VOLUME_ID to instance $INSTANCE_ID"
-                aws ec2 attach-volume \
-                  --volume-id "$VOLUME_ID" \
-                  --instance-id "$INSTANCE_ID" \
-                  --device /dev/sdf \
-                  --region "$REGION" || echo "Attach failed, continuing..."
+                ###############################################################################
+                # 4) Now volume should be free, attach to this instance
+                ###############################################################################
+                # Retrieve instance ID (IMDSv2 fallback to v1) again, just in case
+                TOKEN=$(curl -X PUT -s -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" \
+                  http://169.254.169.254/latest/api/token || true)
+                if [ -n "$$TOKEN" ]; then
+                  INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $$TOKEN" \
+                    http://169.254.169.254/latest/meta-data/instance-id)
+                else
+                  INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
+                fi
+                echo "Instance ID: $$INSTANCE_ID"
                 
-                SYMLINK="/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_${VOLUME_ID}"
+                echo "Attaching volume $$VOLUME_ID to instance $$INSTANCE_ID at /dev/sdf"
+                aws ec2 attach-volume \
+                  --volume-id "$$VOLUME_ID" \
+                  --instance-id "$$INSTANCE_ID" \
+                  --device /dev/sdf \
+                  --region "$$REGION" \
+                  || echo "AttachVolume failed (already attached?), continuing..."
+                
+                ###############################################################################
+                # 5) Wait for the NVMe symlink (up to 30s in 3s increments), format and mount
+                ###############################################################################
+                SYMLINK="/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_$$VOLUME_ID"
+                FOUND_DEVICE=""
                 for i in {1..10}; do
-                  if [ -e "$SYMLINK" ]; then
-                    FOUND_DEVICE=$(readlink -f "$SYMLINK")
+                  if [ -e "$$SYMLINK" ]; then
+                    FOUND_DEVICE=$(readlink -f "$$SYMLINK")
+                    echo "Found volume symlink: $$SYMLINK -> $$FOUND_DEVICE"
                     break
                   fi
+                  echo "Waiting for $$SYMLINK (attempt $$i/10)..."
                   sleep 3
                 done
                 
-                if [ -n "$FOUND_DEVICE" ]; then
-                  if ! blkid "$FOUND_DEVICE"; then
-                    mkfs.ext4 "$FOUND_DEVICE"
+                if [ -z "$$FOUND_DEVICE" ]; then
+                  echo "Volume did not appear after 30s, skipping Docker volume setup."
+                else
+                  # If brand new, format it
+                  if ! blkid "$$FOUND_DEVICE"; then
+                    echo "Formatting $$FOUND_DEVICE as ext4..."
+                    mkfs.ext4 "$$FOUND_DEVICE"
                   fi
                   mkdir -p /var/lib/docker
-                  grep -qs '/var/lib/docker ' /etc/fstab || echo "$FOUND_DEVICE /var/lib/docker ext4 defaults 0 0" >> /etc/fstab
-                  mount -a || true
+                  if ! grep -qs '/var/lib/docker ' /etc/fstab; then
+                    echo "$$FOUND_DEVICE /var/lib/docker ext4 defaults 0 0" >> /etc/fstab
+                  fi
+                  mount -a || echo "Warning: mount -a failed!"
                 fi
                 
+                ###############################################################################
+                # 6) Associate EIP 
+                ###############################################################################
                 aws ec2 associate-address \
                   --allocation-id "${EIPAllocationId}" \
-                  --instance-id "$INSTANCE_ID" \
-                  --region "$REGION" \
+                  --instance-id "$$INSTANCE_ID" \
+                  --region "$$REGION" \
                   --allow-reassociation || echo "EIP association failed"
+                
+                ###############################################################################
+                # 7) Install Docker
+                ###############################################################################
+                apt-get update -y
+                apt-get install -y ca-certificates curl gnupg
+                install -m 0755 -d /etc/apt/keyrings
+                curl -fsSL https://download.docker.com/linux/ubuntu/gpg | tee /etc/apt/keyrings/docker.asc > /dev/null
+                chmod a+r /etc/apt/keyrings/docker.asc
+                echo "deb [signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" \
+                  > /etc/apt/sources.list.d/docker.list
                 
                 apt-get update -y
                 apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
-                systemctl enable docker --now
+                systemctl enable docker
+                systemctl start docker
                 
+                ###############################################################################
+                # 8) Mount EFS for Nextcloud data
+                ###############################################################################
                 mkdir -p /mnt/nextcloud
-                grep -qs '/mnt/nextcloud ' /etc/fstab || echo "${EFSId}.efs.${AWSRegion}.amazonaws.com:/ /mnt/nextcloud nfs4 defaults 0 0" >> /etc/fstab
-                mount -a || true
+                if ! grep -qs '/mnt/nextcloud ' /etc/fstab; then
+                  echo "${EFSId}.efs.${AWSRegion}.amazonaws.com:/ /mnt/nextcloud nfs4 defaults 0 0" >> /etc/fstab
+                fi
+                mount -a || echo "Warning: EFS mount attempt failed."
                 
-                docker pull nextcloud/all-in-one:latest
-                docker run -d --name nextcloud-aio-mastercontainer \
+                ###############################################################################
+                # 9) Pull & run Nextcloud AIO
+                ###############################################################################
+                for i in {1..5}; do
+                  docker pull nextcloud/all-in-one:latest && break
+                  echo "Docker pull failed, retrying..."
+                  sleep 5
+                done
+                
+                docker run --restart always -d \
+                  --name nextcloud-aio-mastercontainer \
                   -p 8080:8080 \
                   -e NEXTCLOUD_DATADIR="/mnt/nextcloud" \
                   -v nextcloud_aio_mastercontainer:/var/lib/docker-aio-config \
                   -v /var/run/docker.sock:/var/run/docker.sock:ro \
                   --privileged \
                   nextcloud/all-in-one:latest
+                
+                echo "User data script complete."
               - {
                   EIPAllocationId: !GetAtt NextcloudEIP.AllocationId,
                   DockerVolumeId: !Ref NextcloudDockerVolume,
@@ -370,23 +491,30 @@ Resources:
                   AWSRegion: !Ref AWS::Region
                 }
 
+  ####################################################
+  # 7) Auto Scaling Group (Spot) - Single Subnet
+  ####################################################
   NextcloudASG:
     Type: AWS::AutoScaling::AutoScalingGroup
     Properties:
-      VPCZoneIdentifier: [!Ref SubnetId]
+      VPCZoneIdentifier:
+        - !Ref SubnetId
+
       MixedInstancesPolicy:
         InstancesDistribution:
-          OnDemandAllocationStrategy: lowest-price
+          OnDemandAllocationStrategy: "lowest-price"
           OnDemandBaseCapacity: 0
-          SpotAllocationStrategy: lowest-price
+          SpotAllocationStrategy: "lowest-price"
           SpotInstancePools: 2
         LaunchTemplate:
           LaunchTemplateSpecification:
             LaunchTemplateId: !Ref NextcloudLaunchTemplate
             Version: !GetAtt NextcloudLaunchTemplate.LatestVersionNumber
+
       MinSize: 0
       DesiredCapacity: !Ref DesiredCapacity
       MaxSize: !Ref MaxCapacity
+
       Tags:
         - Key: Name
           Value: NextcloudAIO
@@ -394,6 +522,7 @@ Resources:
         - Key: NextcloudAIO
           Value: "true"
           PropagateAtLaunch: true
+
     UpdatePolicy:
       AutoScalingRollingUpdate:
         PauseTime: PT0S
@@ -402,10 +531,17 @@ Resources:
 
 Outputs:
   NextcloudEIPAllocationId:
+    Description: EIP Allocation ID
     Value: !GetAtt NextcloudEIP.AllocationId
+
   NextcloudASGName:
+    Description: Auto Scaling Group Name
     Value: !Ref NextcloudASG
+
   NextcloudVolumeId:
+    Description: EBS Volume for Docker
     Value: !Ref NextcloudDockerVolume
+
   NextcloudEFSId:
+    Description: EFS FileSystem
     Value: !Ref NextcloudEFS
