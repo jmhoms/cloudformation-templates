@@ -260,14 +260,6 @@ Resources:
   ####################################################
   NextcloudLaunchTemplate:
     Type: AWS::EC2::LaunchTemplate
-    Properties:
-      # Top-level Tags for the Launch Template resource itself:
-      Tags:
-        - Key: Name
-          Value: NextcloudLaunchTemplate
-        - Key: NextcloudAIO
-          Value: "true"
-
       LaunchTemplateData:
         IamInstanceProfile:
           Arn: !GetAtt NextcloudInstanceProfile.Arn
